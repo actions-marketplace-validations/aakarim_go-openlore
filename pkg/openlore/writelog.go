@@ -2,9 +2,14 @@ package openlore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/aakarim/go-openlore/pkg/vfs"
 )
@@ -20,13 +25,52 @@ type applyResult struct {
 }
 
 // logEntry is one queued mutation plus the buffered channel its submitter blocks
-// on. reply is buffered (cap 1) so the applier never blocks delivering it. actor
-// is the (non-durable) principal that triggered the mutation; it never enters
-// the ChangeSet but flows to the post-commit chain for attribution/audit.
+// on. reply is buffered (cap 1) so the applier never blocks delivering it.
+// Attribution carries the principal and optional delegate that triggered it. It
+// never enters the ChangeSet, but is durably recorded alongside each commit.
 type logEntry struct {
-	cs    vfs.ChangeSet
-	actor Actor
-	reply chan applyResult
+	cs          vfs.ChangeSet
+	attribution Attribution
+	reply       chan applyResult
+}
+
+// CommitRecord is the durable, queryable provenance record for one committed
+// ChangeSet. Fact-level provenance is derived from these records.
+type CommitRecord struct {
+	Time        time.Time     `json:"time"`
+	Attribution Attribution   `json:"attribution"`
+	ChangeSet   vfs.ChangeSet `json:"change_set"`
+	Hash        string        `json:"hash,omitempty"`
+}
+
+type CommitRecorder interface {
+	RecordCommit(context.Context, CommitRecord) error
+}
+
+type JSONLCommitRecorder struct {
+	mu   sync.Mutex
+	path string
+}
+
+func NewJSONLCommitRecorder(path string) *JSONLCommitRecorder {
+	return &JSONLCommitRecorder{path: path}
+}
+
+func (r *JSONLCommitRecorder) RecordCommit(_ context.Context, record CommitRecord) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(record); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // writeLog is the ordered write log and its single serialized applier — the sole
@@ -49,7 +93,8 @@ type writeLog struct {
 
 	mu         sync.RWMutex      // guards closed + postCommit + serializes sends against Close
 	postCommit PostCommitHandler // optional; runs at the applier after a durable commit
-	preApply   func(vfs.ChangeSet) error
+	preApply   func(Attribution, vfs.ChangeSet) error
+	recorder   CommitRecorder
 	closed     bool
 	ch         chan logEntry
 
@@ -90,19 +135,40 @@ func newWriteLog(substrate vfs.WritableFS, postCommit PostCommitHandler, logger 
 func (l *writeLog) run() {
 	defer close(l.done)
 	for e := range l.ch {
-		var h string
+		var committed vfs.CommitResult
 		var err error
+		if preflight, ok := l.substrate.(vfs.ChangePreflighter); ok {
+			for _, change := range e.cs.Leaves() {
+				if err = preflight.PreflightChange(change); err != nil {
+					break
+				}
+			}
+		}
 		l.mu.RLock()
 		pre := l.preApply
 		l.mu.RUnlock()
-		if pre != nil {
-			err = pre(e.cs)
+		if err == nil && pre != nil {
+			err = pre(e.attribution, e.cs)
 		}
 		if err == nil {
-			h, err = vfs.CommitChangeSet(l.substrate, e.cs)
+			committed, err = vfs.CommitChangeSet(l.substrate, e.cs)
 		}
-		e.reply <- applyResult{hash: h, err: err}
-		if err != nil {
+		if err == nil && committed.HasCommitted() {
+			l.mu.RLock()
+			recorder := l.recorder
+			l.mu.RUnlock()
+			if recorder != nil {
+				if recordErr := recorder.RecordCommit(context.Background(), CommitRecord{
+					Time: time.Now().UTC(), Attribution: e.attribution,
+					ChangeSet: committed.Committed, Hash: committed.Hash,
+				}); recordErr != nil {
+					l.logger.Error("commit provenance recording failed after durable write",
+						"target", e.cs.Target, "action", e.cs.Action, "hash", committed.Hash, "err", recordErr)
+				}
+			}
+		}
+		e.reply <- applyResult{hash: committed.Hash, err: err}
+		if !committed.HasCommitted() {
 			continue
 		}
 		l.mu.RLock()
@@ -111,16 +177,22 @@ func (l *writeLog) run() {
 		if pc == nil {
 			continue
 		}
-		if perr := pc(context.Background(), CommitInfo{ChangeSet: e.cs, Hash: h, Actor: e.actor}); perr != nil {
+		if perr := pc(context.Background(), CommitInfo{ChangeSet: committed.Committed, Hash: committed.Hash, Attribution: e.attribution}); perr != nil {
 			l.logger.Error("post-commit chain failed; log continues",
 				"target", e.cs.Target, "action", e.cs.Action, "err", perr)
 		}
 	}
 }
 
-func (l *writeLog) SetPreApply(h func(vfs.ChangeSet) error) {
+func (l *writeLog) SetPreApply(h func(Attribution, vfs.ChangeSet) error) {
 	l.mu.Lock()
 	l.preApply = h
+	l.mu.Unlock()
+}
+
+func (l *writeLog) SetCommitRecorder(recorder CommitRecorder) {
+	l.mu.Lock()
+	l.recorder = recorder
 	l.mu.Unlock()
 }
 
@@ -138,7 +210,7 @@ func (l *writeLog) SetPostCommit(h PostCommitHandler) {
 // returning the committed hash or the CAS/commit error. actor is carried to the
 // post-commit chain. It returns ErrLogClosed if the log is shutting down, or
 // ctx.Err() if ctx is cancelled first.
-func (l *writeLog) Submit(ctx context.Context, actor Actor, cs vfs.ChangeSet) (string, error) {
+func (l *writeLog) Submit(ctx context.Context, attribution Attribution, cs vfs.ChangeSet) (string, error) {
 	reply := make(chan applyResult, 1)
 
 	// Hold the read lock across the send so Close (which takes the write lock)
@@ -149,7 +221,7 @@ func (l *writeLog) Submit(ctx context.Context, actor Actor, cs vfs.ChangeSet) (s
 		return "", ErrLogClosed
 	}
 	select {
-	case l.ch <- logEntry{cs: cs, actor: actor, reply: reply}:
+	case l.ch <- logEntry{cs: cs, attribution: attribution, reply: reply}:
 		l.mu.RUnlock()
 	case <-ctx.Done():
 		l.mu.RUnlock()
@@ -162,6 +234,15 @@ func (l *writeLog) Submit(ctx context.Context, actor Actor, cs vfs.ChangeSet) (s
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+func (r CommitRecord) DisplayAttribution() string { return r.Attribution.String() }
+
+func (r CommitRecord) Validate() error {
+	if r.Attribution.Principal == "" {
+		return fmt.Errorf("commit attribution principal is required")
+	}
+	return nil
 }
 
 // Close stops accepting new submits, lets the applier drain all queued entries

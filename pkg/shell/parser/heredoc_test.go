@@ -146,3 +146,60 @@ func TestStderrMergeBeforePipe(t *testing.T) {
 		t.Errorf("left side MergeStderr should be true")
 	}
 }
+
+func TestStderrFileRedirectTokens(t *testing.T) {
+	for _, tc := range []struct {
+		src    string
+		target string
+		append bool
+	}{
+		{src: "cat /missing 2>/dev/null", target: "/dev/null"},
+		{src: "cat /missing 2>> errors.log", target: "errors.log", append: true},
+	} {
+		f, err := parser.Parse(tc.src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.src, err)
+		}
+		call := f.Stmts[0].Cmd.(*parser.CallExpr)
+		if call.Redirect == nil || !call.Redirect.Stderr || call.Redirect.Append != tc.append {
+			t.Fatalf("%q: redirect = %#v", tc.src, call.Redirect)
+		}
+		if got := call.Redirect.Target.Parts[0].(*parser.Lit).Value; got != tc.target {
+			t.Errorf("%q: target = %q, want %q", tc.src, got, tc.target)
+		}
+	}
+}
+
+func TestStdoutRedirectAdjacentToWord(t *testing.T) {
+	f, err := parser.Parse("cat $P/index.md>/tmp/pi.md")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	call := f.Stmts[0].Cmd.(*parser.CallExpr)
+	if call.Redirect == nil || call.Redirect.Stderr || call.Redirect.Append {
+		t.Fatalf("redirect = %#v", call.Redirect)
+	}
+	if got := call.Redirect.Target.Parts[0].(*parser.Lit).Value; got != "/tmp/pi.md" {
+		t.Fatalf("target = %q, want /tmp/pi.md", got)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("redirect leaked into command arguments: %#v", call.Args)
+	}
+}
+
+func TestUnsupportedFDRedirectRemainsAWord(t *testing.T) {
+	f, err := parser.Parse("echo hi >&2")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	call := f.Stmts[0].Cmd.(*parser.CallExpr)
+	if call.Redirect != nil {
+		t.Fatalf("unsupported fd redirect became a redirect: %#v", call.Redirect)
+	}
+	if len(call.Args) != 3 {
+		t.Fatalf("args = %#v, want echo, hi, and >&2", call.Args)
+	}
+	if got := call.Args[2].Parts[0].(*parser.Lit).Value; got != ">&2" {
+		t.Fatalf("unsupported fd redirect = %q, want >&2", got)
+	}
+}

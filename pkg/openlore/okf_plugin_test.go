@@ -28,7 +28,7 @@ func runOKF(p *okfPlugin, cs vfs.ChangeSet) (reachedTerminal bool, err error) {
 		return WriteResult{Hash: "ok"}, nil
 	}
 	h := mws[0](terminal)
-	_, err = h(context.Background(), WriteOp{ChangeSet: cs})
+	_, err = h(context.Background(), NewWriteOp(Attribution{}, cs))
 	return reachedTerminal, err
 }
 
@@ -61,6 +61,17 @@ func TestOKFPlugin_RejectsNonConformantMarkdown(t *testing.T) {
 	}
 	if reached {
 		t.Fatal("terminal handler should not be reached when a write is rejected")
+	}
+}
+
+func TestOKFPlugin_RejectsForbiddenLaterBatchLeaf(t *testing.T) {
+	cs := vfs.ChangeSet{Changes: []vfs.Change{
+		{Target: "/docs/good.md", Action: vfs.ChangeActionWrite, Write: &vfs.WriteChange{Bytes: []byte(validDoc)}},
+		{Target: "/docs/bad.md", Action: vfs.ChangeActionWrite, Write: &vfs.WriteChange{Bytes: []byte(invalidDoc)}},
+	}}
+	reached, err := runOKF(pluginWith(docsWithOKF()), cs)
+	if err == nil || reached {
+		t.Fatalf("later invalid leaf was not rejected: reached=%v err=%v", reached, err)
 	}
 }
 
@@ -439,13 +450,15 @@ func TestRegisterPlugin_ValidateCommandIsCoreAndValidatorsAreSessionLocal(t *tes
 	}
 	withOut.Reset()
 	withoutOut.Reset()
+	errOut.Reset()
 	if code := withShell.ExecPipeline("lore validate", &withOut, &errOut, nil); code != 1 {
 		t.Fatalf("with plugin exit=%d, want 1: %s", code, withOut.String())
 	}
+	errOut.Reset()
 	if code := withoutShell.ExecPipeline("lore validate", &withoutOut, &errOut, nil); code != 0 {
-		t.Fatalf("without plugin exit=%d, want 0: %s", code, withoutOut.String())
+		t.Fatalf("without plugin exit=%d, want 0: %s", code, errOut.String())
 	}
-	if !strings.Contains(withOut.String(), "okf/concept") || withoutOut.String() != "0 errors, 0 warnings\n" {
-		t.Fatalf("validators not session-local: with=%q without=%q", withOut.String(), withoutOut.String())
+	if !strings.Contains(withOut.String(), "okf/concept") || withoutOut.String() != "" || !strings.Contains(errOut.String(), "warning: no validators enabled") {
+		t.Fatalf("validators not session-local: with=%q without=%q stderr=%q", withOut.String(), withoutOut.String(), errOut.String())
 	}
 }

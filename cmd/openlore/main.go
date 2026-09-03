@@ -488,6 +488,47 @@ func main() {
 			}
 			return
 
+		case "oauth":
+			if len(os.Args) < 4 || os.Args[2] != "keys" || os.Args[3] != "rotate" {
+				fmt.Fprintln(os.Stderr, "Usage: openlore oauth keys rotate [--revoke-previous] [--config openlore.yml]")
+				os.Exit(1)
+			}
+			rotateCmd := flag.NewFlagSet("oauth keys rotate", flag.ExitOnError)
+			revokePrevious := rotateCmd.Bool("revoke-previous", false, "immediately remove previous keys and invalidate outstanding access tokens")
+			configPath := rotateCmd.String("config", "./openlore.yml", "path to openlore.yml")
+			rotateCmd.Parse(os.Args[4:])
+			cfg, err := config.New(config.WithConfigFile(*configPath))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			issuer, err := openlore.NewIssuerFromConfig(cfg)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			keys, ok := issuer.(openlore.SigningKeyStore)
+			if !ok {
+				fmt.Fprintln(os.Stderr, "error: configured issuer does not support key rotation")
+				os.Exit(1)
+			}
+			oldKid := keys.ActiveKeyID()
+			newKid, err := keys.Rotate(*revokePrevious)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			dataDir := cfg.DataDir
+			if dataDir == "" {
+				dataDir = "."
+			}
+			audit := openlore.NewJSONLAuditLog(filepath.Join(dataDir, "audit", "events.jsonl"))
+			_ = audit.Record(context.Background(), openlore.AuditEvent{Type: "oauth.key_rotate", Attribution: openlore.Attribution{Principal: "operator"}, Details: map[string]any{
+				"old_kid": oldKid, "new_kid": newKid, "revoke_previous": *revokePrevious,
+			}})
+			fmt.Println(newKid)
+			return
+
 		case "token":
 			if len(os.Args) < 3 {
 				fmt.Fprintf(os.Stderr, "Usage: openlore token <command>\n\n")
@@ -502,7 +543,7 @@ func main() {
 				tokCmd := flag.NewFlagSet("token mint", flag.ExitOnError)
 				identity := tokCmd.String("identity", "", "identity name = token `sub` (required)")
 				scope := tokCmd.String("scope", openlore.ScopeFull, "token scope")
-				ttl := tokCmd.Duration("ttl", 30*time.Minute, "access token lifetime")
+				ttl := tokCmd.Duration("ttl", time.Hour, "access token lifetime")
 				configPath := tokCmd.String("config", "./openlore.yml", "path to openlore.yml (holds the tokens block + data dir)")
 				tokCmd.Parse(os.Args[3:])
 
@@ -520,7 +561,7 @@ func main() {
 					fmt.Fprintf(os.Stderr, "error: %v\n", err)
 					os.Exit(1)
 				}
-				token, exp, err := issuer.Mint(*identity, *scope, *ttl)
+				token, exp, err := issuer.Mint(openlore.Attribution{Principal: *identity}, *scope, *ttl)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "error: minting token: %v\n", err)
 					os.Exit(1)
@@ -562,6 +603,17 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Unknown token command: %s\n", os.Args[2])
 				os.Exit(1)
 			}
+
+		case "inbox":
+			if len(os.Args) < 4 || os.Args[2] != "token" {
+				fmt.Fprintln(os.Stderr, "Usage: openlore inbox token <create|list|revoke>")
+				os.Exit(1)
+			}
+			if err := inboxTokenCommand(os.Args[3:], os.Stdout, os.Stderr, time.Now); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
 		}
 	}
 
@@ -584,6 +636,7 @@ func main() {
 	allowed := flag.String("allowed", "", "comma-separated file patterns to serve (e.g. '*.md,*.txt')")
 	ignore := flag.String("ignore", "", "comma-separated patterns to ignore (e.g. '.git,node_modules')")
 	readonly := flag.Bool("readonly", true, "global write lock; pass --readonly=false to enable the experimental writable substrate")
+	debug := flag.Bool("debug", false, "enable debug-level server logging")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: openlore [flags] [directory]\n\n")
@@ -595,12 +648,6 @@ func main() {
 	}
 
 	flag.Parse()
-
-	// Set up structured logging
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
 
 	// Determine directory to serve (if provided)
 	var rootDir string
@@ -628,7 +675,6 @@ func main() {
 	opts := []openlore.Option{
 		openlore.WithConfigFile(*configFile),
 		openlore.WithEmbeddedConfig(embeddedCfg, assets.DefaultMOTD()),
-		openlore.WithLogger(logger),
 	}
 
 	if *port != 0 {
@@ -676,12 +722,31 @@ func main() {
 	if isFlagSet("readonly") {
 		opts = append(opts, openlore.WithReadonly(*readonly))
 	}
+	if isFlagSet("debug") {
+		opts = append(opts, openlore.WithDebug(*debug))
+	}
+
+	// Resolve the effective debug setting before constructing the logger. The
+	// server resolves the same options when it starts; doing it here ensures a
+	// debug value from openlore.yml controls the handler's level too.
+	resolved, err := config.New(opts...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid config: %v\n", err)
+		os.Exit(1)
+	}
+	level := slog.LevelInfo
+	if resolved.Debug {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
+	opts = append(opts, openlore.WithLogger(logger))
 
 	// Create server. Embedded docs are installed as the lower layer during
 	// construction so a configured writable_dir can be the upper layer before
 	// the ordered write log is initialized.
 	var srv *openlore.Server
-	var err error
+	err = nil
 	if rootDir == "" && assets.Lore() != nil {
 		srv, err = openlore.NewServerWithLowerFS(assets.Lore(), opts...)
 	} else {
@@ -738,6 +803,114 @@ func main() {
 		slog.Error("server exited with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func inboxTokenCommand(args []string, stdout, stderr io.Writer, now func() time.Time) error {
+	if len(args) == 0 {
+		return fmt.Errorf("missing inbox token command")
+	}
+	command := args[0]
+	flags := flag.NewFlagSet("inbox token "+command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "./openlore.yml", "path to openlore.yml")
+	var identity, label *string
+	var ttl *time.Duration
+	parseArgs := args[1:]
+	switch command {
+	case "create":
+		identity = flags.String("identity", "", "identity name")
+		label = flags.String("label", "", "credential label")
+		ttl = flags.Duration("ttl", 0, "credential lifetime (zero means no expiry)")
+	case "list":
+	case "revoke":
+		// The documented TOKEN_ID-before-flags form is normalized for flag.FlagSet,
+		// which otherwise stops parsing at the first positional argument.
+		if len(parseArgs) > 0 && !strings.HasPrefix(parseArgs[0], "-") {
+			parseArgs = append(append([]string{}, parseArgs[1:]...), parseArgs[0])
+		}
+	default:
+		return fmt.Errorf("unknown inbox token command: %s", command)
+	}
+	if err := flags.Parse(parseArgs); err != nil {
+		return err
+	}
+	if command != "revoke" && flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	cfg, err := config.New(config.WithConfigFile(*configPath))
+	if err != nil {
+		return err
+	}
+	store, err := openlore.NewInboxTokenStore(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	switch command {
+	case "create":
+		if *identity == "" {
+			return fmt.Errorf("--identity is required")
+		}
+		if cfg.AuthFile == "" {
+			return fmt.Errorf("auth_file is required to validate the inbox token identity")
+		}
+		if *ttl < 0 {
+			return fmt.Errorf("ttl must not be negative")
+		}
+		{
+			auth, err := config.LoadAuthConfig(cfg.AuthFile)
+			if err != nil {
+				return err
+			}
+			found := false
+			for _, id := range auth.Identities {
+				if id.Name == *identity {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("identity %q not found", *identity)
+			}
+		}
+		var expires *time.Time
+		if *ttl > 0 {
+			t := now().UTC().Add(*ttl)
+			expires = &t
+		}
+		t, err := store.Create(*identity, *label, expires)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, t.Credential())
+		fmt.Fprintf(stderr, "id=%s identity=%s expires=%v\n", t.ID, t.Identity, t.ExpiresAt)
+	case "list":
+		tokens, err := store.List()
+		if err != nil {
+			return err
+		}
+		for _, t := range tokens {
+			fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", t.ID, t.Identity, t.Label, expiryText(t.ExpiresAt))
+		}
+	case "revoke":
+		if flags.NArg() != 1 {
+			return fmt.Errorf("revoke requires TOKEN_ID")
+		}
+		ok, err := store.Delete(flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("token not found")
+		}
+	}
+	return nil
+}
+
+func expiryText(t *time.Time) string {
+	if t == nil {
+		return "never"
+	}
+	return t.Format(time.RFC3339)
 }
 
 func isFlagSet(name string) bool {

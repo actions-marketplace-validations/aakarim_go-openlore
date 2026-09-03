@@ -66,6 +66,85 @@ func TestRedirect_ReadOnly_HardError(t *testing.T) {
 	}
 }
 
+func TestRedirect_OutsideWriteSurfaceIsStillRedirection(t *testing.T) {
+	dir := t.TempDir()
+	d := NewDirFS(dir, config.FilesConfig{})
+	if err := d.SetWriteable(); err != nil {
+		t.Fatalf("SetWriteable: %v", err)
+	}
+	if err := os.Mkdir(d.resolve("/docs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	if err := os.WriteFile(d.resolve("/docs/index.md"), []byte("content\n"), 0o644); err != nil {
+		t.Fatalf("seed index: %v", err)
+	}
+	sh := shell.NewShell(newScopedWriteFS(d, rootsAuthz("/docs")))
+	sh.SetEnv("P", "/docs")
+
+	for _, command := range []string{
+		"cat $P/index.md > /tmp/pi.md",
+		"cat $P/index.md>/tmp/pi.md",
+	} {
+		out, errs, code := run(sh, command)
+		if code == 0 {
+			t.Fatalf("%q: redirect outside write surface should fail; out=%q err=%q", command, out, errs)
+		}
+		if !strings.Contains(errs, "redirect: /tmp/pi.md: read-only filesystem") {
+			t.Fatalf("%q: expected redirect error, got %q", command, errs)
+		}
+		if strings.Contains(errs, "command not found") {
+			t.Fatalf("%q: redirect target was treated as a command: %q", command, errs)
+		}
+	}
+}
+
+func TestRedirect_DevNullDiscardsWithoutWriteCapability(t *testing.T) {
+	dir := t.TempDir()
+	d := NewDirFS(dir, config.FilesConfig{}) // read-only substrate
+	sh := shell.NewShell(d)
+	sh.SetAllowedActions(nil) // read-only session
+
+	for _, line := range []string{
+		"echo discarded > /dev/null",
+		"echo discarded >> /dev/null",
+		"cat /missing 2>/dev/null",
+		"cat /missing 2>>/dev/null",
+	} {
+		out, errs, code := run(sh, line)
+		if strings.HasPrefix(line, "echo") && code != 0 {
+			t.Errorf("%q: got code=%d", line, code)
+		}
+		if strings.HasPrefix(line, "cat") && code == 0 {
+			t.Errorf("%q: command failure was suppressed", line)
+		}
+		if out != "" || errs != "" {
+			t.Errorf("%q: got code=%d out=%q err=%q", line, code, out, errs)
+		}
+	}
+	if _, err := os.Stat(d.resolve("/dev/null")); !os.IsNotExist(err) {
+		t.Fatal("redirect to /dev/null must not create a virtual file")
+	}
+}
+
+func TestRedirect_StderrToFile(t *testing.T) {
+	sh, d, _ := newWritableShell(t)
+
+	out, errs, code := run(sh, "cat /first-missing 2>/errors.log")
+	if code == 0 || out != "" || errs != "" {
+		t.Fatalf("stderr redirect: got code=%d out=%q err=%q", code, out, errs)
+	}
+	first, err := d.ReadFile("/errors.log")
+	if err != nil || !strings.Contains(string(first), "first-missing") {
+		t.Fatalf("redirected stderr = %q, err=%v", first, err)
+	}
+
+	run(sh, "cat /second-missing 2>>/errors.log")
+	got, err := d.ReadFile("/errors.log")
+	if err != nil || !strings.Contains(string(got), "first-missing") || !strings.Contains(string(got), "second-missing") {
+		t.Fatalf("appended stderr = %q, err=%v", got, err)
+	}
+}
+
 func TestRedirect_MidStreamError_CommitsNothing(t *testing.T) {
 	sh, d, _ := newWritableShell(t)
 

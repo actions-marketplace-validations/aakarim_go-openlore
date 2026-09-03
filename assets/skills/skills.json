@@ -1,12 +1,64 @@
 {
   "skills": {
     "teach": {
-      "description": "Learn how to set up OpenLore for your project",
+      "description": "Set up a new Lore server, connect to an existing one, or learn what a Lore server is",
       "file": "teach.md"
+    },
+    "setup": {
+      "description": "Create and locally verify a deployable OpenLore project",
+      "file": "setup.md"
+    },
+    "onboarding": {
+      "description": "Add initial identities and folders before deployment",
+      "file": "onboarding.md"
+    },
+    "deploy": {
+      "description": "Deploy and verify an OpenLore project",
+      "file": "deploy.md"
+    },
+    "deploy-fly": {
+      "description": "Deploy OpenLore to Fly.io",
+      "file": "deploy/fly.md"
+    },
+    "deploy-railway": {
+      "description": "Deploy OpenLore to Railway",
+      "file": "deploy/railway.md"
+    },
+    "deploy-aws": {
+      "description": "Deploy OpenLore to AWS",
+      "file": "deploy/aws.md"
+    },
+    "deploy-gcp": {
+      "description": "Deploy OpenLore to Google Cloud",
+      "file": "deploy/gcp.md"
+    },
+    "deploy-azure": {
+      "description": "Deploy OpenLore to Microsoft Azure",
+      "file": "deploy/azure.md"
+    },
+    "deploy-digitalocean": {
+      "description": "Deploy OpenLore to DigitalOcean",
+      "file": "deploy/digitalocean.md"
+    },
+    "upgrade": {
+      "description": "Prepare an OpenLore base-image version upgrade",
+      "file": "upgrade.md"
     },
     "agents": {
       "description": "Get an AGENTS.md snippet for your AI agents",
       "file": "agents.md"
+    },
+    "openlore-skill": {
+      "description": "Get an installable Agent Skills SKILL.md for accessing this server",
+      "file": "openlore/SKILL.md"
+    },
+    "agents-shellm": {
+      "description": "Get a headlong/shellm SKILL.md for accessing this server",
+      "file": "agents/shellm/openlore/SKILL.md"
+    },
+    "agents-shellm-housekeeping": {
+      "description": "Get a headlong/shellm SKILL.md for knowledge-base housekeeping",
+      "file": "agents/shellm/openlore-housekeeping/SKILL.md"
     },
     "passkeys": {
       "description": "Register passkeys for browser access to docs",

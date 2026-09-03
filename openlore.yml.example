@@ -9,6 +9,13 @@
 # Config file version. Used for migration between config formats.
 version: "1"
 
+# Enable verbose server logs, including unknown command and syntax telemetry.
+debug: false
+
+plugins:
+  skills:
+    enabled: false
+
 # Optional disk-backed content root. When the binary includes embedded docs,
 # this directory is overlaid at the same virtual root: its filesystem hierarchy
 # defines paths, while lore.json independently defines docsets and access.
@@ -60,6 +67,13 @@ api:
 # Only applies to the HTTP front page, not SSH.
 # tls_cert: ./cert.pem
 # tls_key: ./key.pem
+
+# Optional best-effort client-certificate corroboration for authenticated OAuth
+# clients. OpenLore must terminate TLS itself. Clients without a certificate can
+# still connect; a presented certificate must chain to this CA bundle.
+# auth:
+#   mtls:
+#     ca_bundle: /etc/openlore/openai-connectors-ca.pem
 
 # Path to the SSH host key. Auto-generated on first run if missing.
 # Uses ed25519 by default.
@@ -114,10 +128,9 @@ host_key_path: .ssh/openlore_ed25519
 
 # ── Passkeys / WebAuthn ───────────────────────────────
 #
-# Enable browser-based passkey authentication for human access
-# to documentation via the HTTP server. When enabled, users can
-# register passkeys from the SSH shell (`passkey` command) and
-# then browse docs at /lore/ in a web browser.
+# Browser passkeys default to enabled for http://localhost:8080. Users can
+# register from SSH (`passkey`) and browse at /lore/. Set `enabled: false` to
+# disable them. For deployment, configure the public HTTPS domain explicitly:
 #
 # passkeys:
 #   enabled: true
@@ -143,11 +156,15 @@ host_key_path: .ssh/openlore_ed25519
 # tokens via the OAuth authorization-code + PKCE flow at /authorize →
 # /oauth/token. Mint a debug/local token with:
 #   openlore token mint --identity NAME --config ./openlore.yml
+# Rotate the ES256 signing key without downtime with:
+#   openlore oauth keys rotate --config ./openlore.yml
+# Add --revoke-previous only for compromise response; it immediately invalidates
+# access tokens signed by every previous key.
 #
 # tokens:
 #   issuer: https://docs.example.com      # `iss` claim + JWKS base URL
 #   audience: https://docs.example.com    # required `aud`; one per instance
-#   access_ttl: 30m                       # access-token lifetime
+#   access_ttl: 1h                        # access-token lifetime
 #   refresh_ttl: 720h                     # refresh-token lifetime
 #
 # Workload Identity Federation (WIF): external IdPs whose JWTs are exchanged for
@@ -159,6 +176,23 @@ host_key_path: .ssh/openlore_ed25519
 #   - issuer_url: https://token.actions.githubusercontent.com
 #     jwks:
 #       mode: discovery
+#   - issuer_url: https://spire.example
+#     jwks:
+#       mode: url
+#       url: https://spire.example/keys  # direct JWKS/trust-bundle endpoint
+
+# ── Inbox HTTP uploads ────────────────────────────────
+# Inbox credentials are separate, revocable webhook secrets. They may only
+# publish to a docset inbox allowed by the credential identity's live grants.
+# `auth_file` is mandatory for CLI credential creation. This bounded in-memory
+# policy is independent and does not permit these types/sizes via shell or MCP.
+inbox:
+  max_upload_size: 10MB
+  allowed_types:
+    - extensions: [".md", ".markdown"]
+      mime: text/markdown
+#     - extensions: [".m4a"]
+#       mime: audio/mp4
 
 # ── Content ───────────────────────────────────────────
 

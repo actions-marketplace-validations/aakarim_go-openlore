@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "provider": "golang",
+  "steps": {
+    "build": {
+      "commands": [
+        "rm assets/config/openlore.yml",
+        "go build -o out ./cmd/openlore"
+      ]
+    }
+  },
+  "deploy": {
+    "startCommand": "./out --config /var/lib/openlore/config/openlore.yml",
+    "inputs": [
+      "..."
+    ]
+  }
+}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 
 	"github.com/aakarim/go-openlore/internal/config"
 	"github.com/aakarim/go-openlore/pkg/shell"
@@ -56,6 +57,33 @@ func TestAliasFS_ReadsListsAndWritesCanonicalStorage(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(canonicalDir, "new.md"))
 	if err != nil || string(got) != "new" {
 		t.Fatalf("canonical file after alias write = %q, %v", got, err)
+	}
+}
+
+func TestBuildCanonicalSessionFSOmitsAliases(t *testing.T) {
+	s := grantTestServer()
+	merge := NewMergeFS()
+	merge.SetRoot(NewFSAdapter(fstest.MapFS{
+		"agent/jared/note.md": {Data: []byte("hello")},
+	}))
+	s.merge = merge
+	ds := s.auth.Docsets["alfie"]
+	ds.Paths = []config.PathMapping{{Source: "/agent/jared", Display: "/agent/jared"}}
+	ds.Aliases = []string{"/jared"}
+	s.auth.Docsets["alfie"] = ds
+
+	id := identityWithPolicy("jared", "alfie-rw")
+	canonical := s.buildCanonicalSessionFS(id)
+	if _, err := canonical.ReadFile("/agent/jared/note.md"); err != nil {
+		t.Fatalf("canonical path should remain visible: %v", err)
+	}
+	if _, err := canonical.Stat("/jared"); err == nil {
+		t.Fatal("canonical session filesystem exposed alias")
+	}
+
+	aliased := s.buildSessionFS(id)
+	if got, err := aliased.ReadFile("/jared/note.md"); err != nil || string(got) != "hello" {
+		t.Fatalf("filesystem transports lost alias: %q, %v", got, err)
 	}
 }
 
@@ -109,7 +137,7 @@ func TestAliasFS_CanonicalizesMiddlewarePaths(t *testing.T) {
 	base := NewDirFS(root, config.FilesConfig{})
 
 	var readPath string
-	readView := newReadChainFS(base, Actor{}, func(_ context.Context, op ReadOp) error {
+	readView := newReadChainFS(base, Attribution{}, func(_ context.Context, op ReadOp) error {
 		readPath = op.Path
 		return nil
 	})
@@ -122,8 +150,8 @@ func TestAliasFS_CanonicalizesMiddlewarePaths(t *testing.T) {
 	}
 
 	var changePath string
-	writeView := newMiddlewareFS(base, Actor{}, func(_ context.Context, op WriteOp) (WriteResult, error) {
-		changePath = op.ChangeSet.Target
+	writeView := newMiddlewareFS(base, Attribution{}, func(_ context.Context, op WriteOp) (WriteResult, error) {
+		changePath = op.Leaves()[0].Target
 		return WriteResult{}, nil
 	})
 	writeAlias := newAliasFS(writeView, []pathAlias{{Alias: "/knowledge", Target: "/channel/general"}})
@@ -215,8 +243,8 @@ func TestAliasFS_RewritesNamedMountFileInfoAndPreservesFileType(t *testing.T) {
 func TestAliasFS_CanonicalizesRemoveSnapshotWithoutMutatingCaller(t *testing.T) {
 	snapshot := &vfs.TreeSnapshot{Root: "/knowledge/old", Ops: []vfs.TreeOp{{RelPath: ".", Kind: "dir"}}}
 	var got vfs.ChangeSet
-	writeView := newMiddlewareFS(failingReadFS{err: os.ErrNotExist}, Actor{}, func(_ context.Context, op WriteOp) (WriteResult, error) {
-		got = op.ChangeSet
+	writeView := newMiddlewareFS(failingReadFS{err: os.ErrNotExist}, Attribution{}, func(_ context.Context, op WriteOp) (WriteResult, error) {
+		got = op.persistenceChangeSet()
 		return WriteResult{}, nil
 	})
 	fsys := newAliasFS(writeView, []pathAlias{{Alias: "/knowledge", Target: "/channel/general"}})
@@ -252,5 +280,14 @@ func TestServerCanonicalChangeSetCopiesRemoveSnapshot(t *testing.T) {
 	}
 	if got.RemoveAll.Opts.Expected.Ops[0].Kind != "dir" {
 		t.Fatal("canonical changeset shares the caller's snapshot operations")
+	}
+
+	batchSnapshot := &vfs.TreeSnapshot{Root: "/alfie/batch", Ops: []vfs.TreeOp{{RelPath: ".", Kind: "dir"}}}
+	batch := s.canonicalChangeSet(vfs.ChangeSet{Changes: []vfs.Change{
+		{Target: "/alfie/new.md", Action: vfs.ChangeActionWrite, Write: &vfs.WriteChange{Bytes: []byte("new")}},
+		{Target: "/alfie/batch", Action: vfs.ChangeActionRemoveAll, RemoveAll: &vfs.RemoveAllChange{Opts: vfs.RemoveOpts{Expected: batchSnapshot}}},
+	}})
+	if batch.Changes[0].Target != "/user/alfie/new.md" || batch.Changes[1].Target != "/user/alfie/batch" || batch.Changes[1].RemoveAll.Opts.Expected.Root != "/user/alfie/batch" {
+		t.Fatalf("canonical batch = %+v", batch)
 	}
 }

@@ -3,10 +3,12 @@ package openlore
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/aakarim/go-openlore/assets"
 	"github.com/aakarim/go-openlore/pkg/shell"
 	"github.com/aakarim/go-openlore/pkg/shell/cmds"
 	"github.com/aakarim/go-openlore/pkg/vfs"
@@ -21,6 +23,7 @@ type mcpConfig struct {
 	instructions     string
 	shellDescription string
 	envVars          map[string]string
+	readOnly         bool
 	// shellFactory, when set, builds the shell for each `shell` tool call from
 	// the request context (used to scope the shell per authenticated identity).
 	// When nil, a shell is built from the fixed filesystem plus envVars.
@@ -50,6 +53,13 @@ func WithMCPEnvVars(vars map[string]string) MCPOption {
 	return func(c *mcpConfig) { c.envVars = vars }
 }
 
+// WithMCPReadOnly describes whether the shell's filesystem is globally
+// read-only. The hint is reported to MCP clients and does not replace runtime
+// filesystem or identity-level authorization.
+func WithMCPReadOnly(readOnly bool) MCPOption {
+	return func(c *mcpConfig) { c.readOnly = readOnly }
+}
+
 // withMCPShellFactory sets a per-request shell factory. Used internally by the
 // server to scope the `shell` tool to the authenticated identity resolved from
 // the request context. Unexported: external callers scope by passing their own
@@ -62,7 +72,7 @@ func withMCPShellFactory(fn func(ctx context.Context) *shell.Shell) MCPOption {
 // returned server exposes two tools — `shell` and `list_commands` — that let
 // agents browse and operate on the filesystem via a restricted shell.
 func NewMCPServer(fs vfs.FileSystem, opts ...MCPOption) *mcp.Server {
-	var cfg mcpConfig
+	cfg := mcpConfig{readOnly: true}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -77,29 +87,51 @@ func NewMCPServer(fs vfs.FileSystem, opts ...MCPOption) *mcp.Server {
 		serverName = cfg.serverName
 	}
 	server := mcp.NewServer(
-		&mcp.Implementation{Name: serverName, Version: "1.0.0"},
+		&mcp.Implementation{
+			Name:    serverName,
+			Version: "1.0.0",
+			Icons: []mcp.Icon{{
+				Source:   "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(assets.OiyaIcon()),
+				MIMEType: "image/svg+xml",
+				Sizes:    []string{"any"},
+			}},
+		},
 		serverOpts,
 	)
 
-	shellDesc := "Execute a bash command against the knowledge base filesystem. Supports ls, cat, grep, find, tree, head, tail, wc, stat, sort, uniq, cut, sed, awk, jq, xargs, pipes, loops, and more."
+	shellDesc := "Execute a command in OpenLore's restricted knowledge-base shell. This is not Bash and cannot run arbitrary executables. Supports ls, cat, grep, find, tree, head, tail, wc, stat, sort, uniq, cut, sed, awk, jq, xargs, pipes, loops, and more; use list_commands for the available surface."
 	if cfg.shellDescription != "" {
 		shellDesc = cfg.shellDescription
 	}
+	destructive := !cfg.readOnly
+	openWorld := false
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "shell",
 		Description: shellDesc,
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "OpenLore Shell",
+			ReadOnlyHint:    cfg.readOnly,
+			DestructiveHint: &destructive,
+			OpenWorldHint:   &openWorld,
+		},
 	}, newMCPShellHandler(fs, cfg.envVars, cfg.shellFactory))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_commands",
 		Description: "List all available shell commands.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:          "List OpenLore Commands",
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+			OpenWorldHint:  &openWorld,
+		},
 	}, newMCPListCommandsHandler())
 
 	return server
 }
 
 type mcpShellInput struct {
-	Command string `json:"command" jsonschema:"The bash command to execute (e.g. grep -r auth /docs)"`
+	Command string `json:"command" jsonschema:"The OpenLore shell command to execute (e.g. grep -r auth /docs). This is a restricted interpreter, not Bash."`
 }
 
 func newMCPShellHandler(fs vfs.FileSystem, envVars map[string]string, factory func(ctx context.Context) *shell.Shell) mcp.ToolHandlerFor[mcpShellInput, any] {
@@ -157,7 +189,7 @@ func newMCPListCommandsHandler() mcp.ToolHandlerFor[mcpListCommandsInput, any] {
 			sb.WriteString(name)
 			sb.WriteString("\n")
 		}
-		sb.WriteString("\nShell syntax: pipes (|), && / ||, for/while/if, variables, subshells")
+		sb.WriteString("\nOpenLore restricted-shell syntax: pipes (|), && / ||, for/while/if, variables, subshells. This is not Bash and cannot run arbitrary executables.")
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: sb.String()}},
 		}, nil, nil

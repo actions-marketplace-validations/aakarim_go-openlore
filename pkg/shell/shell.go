@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aakarim/go-openlore/pkg/openlore/meta"
 	"github.com/aakarim/go-openlore/pkg/openlore/validation"
@@ -34,14 +35,33 @@ type Shell struct {
 	// docsets and publishTargets are the per-session views the host computes
 	// from the identity's lore. Read by `lore docsets` and `publish`
 	// respectively. nil for a standalone shell.
-	docsets        []cmds.DocsetInfo
-	publishTargets []cmds.PublishTarget
+	docsets                 []cmds.DocsetInfo
+	publishTargets          []cmds.PublishTarget
+	unsupportedUsageHandler func(UnsupportedUsage)
 	// metaExtenders are the plugin-contributed extenders applied by `lore meta`,
 	// installed by the host per session. nil for a standalone shell.
 	metaExtenders []meta.Extender
 	metaFilters   []meta.Filter
 	// validators are plugin-contributed checks applied by `lore validate`.
-	validators []validation.Validator
+	validators           []validation.Validator
+	skillsManagement     bool
+	skillsRemoteTimeout  time.Duration
+	skillsRemoteMaxBytes int64
+	attribution          cmds.JobAttribution
+	configReload         cmds.ConfigReloadBackend
+	history              cmds.HistoryBackend
+	jobs                 cmds.JobBackend
+	exitRequested        bool
+}
+
+// UnsupportedUsage describes a command or shell syntax that OpenLore does not
+// understand. Command is set for unknown commands; Syntax and Error are set for
+// parse failures.
+type UnsupportedUsage struct {
+	Kind    string
+	Command string
+	Syntax  string
+	Error   string
 }
 
 // NewShell creates a new Shell backed by the given vfs.FileSystem.
@@ -50,6 +70,12 @@ func NewShell(fs vfs.FileSystem) *Shell {
 		fs:  fs,
 		cwd: "/",
 	}
+}
+
+// SetUnsupportedUsageHandler installs optional telemetry for unsupported shell
+// usage. It does not change command output or exit status.
+func (s *Shell) SetUnsupportedUsageHandler(handler func(UnsupportedUsage)) {
+	s.unsupportedUsageHandler = handler
 }
 
 // SetAllowedActions restricts the shell to the given capability classes
@@ -120,7 +146,22 @@ func (s *Shell) MetaFilters() []meta.Filter     { return s.metaFilters }
 func (s *Shell) SetValidators(validators []validation.Validator) { s.validators = validators }
 
 // Validators reports this shell's plugin-contributed validation checks.
-func (s *Shell) Validators() []validation.Validator { return s.validators }
+func (s *Shell) Validators() []validation.Validator      { return s.validators }
+func (s *Shell) SetSkillsManagementEnabled(enabled bool) { s.skillsManagement = enabled }
+func (s *Shell) SkillsManagementEnabled() bool           { return s.skillsManagement }
+func (s *Shell) SetSkillsRemoteConfig(timeout time.Duration, maxBytes int64) {
+	s.skillsRemoteTimeout, s.skillsRemoteMaxBytes = timeout, maxBytes
+}
+func (s *Shell) SkillsRemoteTimeout() time.Duration                { return s.skillsRemoteTimeout }
+func (s *Shell) SkillsRemoteMaxBytes() int64                       { return s.skillsRemoteMaxBytes }
+func (s *Shell) SetCommandAttribution(a cmds.JobAttribution)       { s.attribution = a }
+func (s *Shell) CommandAttribution() cmds.JobAttribution           { return s.attribution }
+func (s *Shell) SetConfigReloadBackend(b cmds.ConfigReloadBackend) { s.configReload = b }
+func (s *Shell) ConfigReloadBackend() cmds.ConfigReloadBackend     { return s.configReload }
+func (s *Shell) SetHistoryBackend(b cmds.HistoryBackend)           { s.history = b }
+func (s *Shell) HistoryBackend() cmds.HistoryBackend               { return s.history }
+func (s *Shell) SetJobBackend(b cmds.JobBackend)                   { s.jobs = b }
+func (s *Shell) JobBackend() cmds.JobBackend                       { return s.jobs }
 
 // --- CmdContext interface implementation ---
 
@@ -173,6 +214,7 @@ func (s *Shell) ExecPipeline(line string, w io.Writer, errW io.Writer, stdin io.
 }
 
 func (s *Shell) execLine(line string, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	s.exitRequested = false
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return 0
@@ -180,6 +222,17 @@ func (s *Shell) execLine(line string, w io.Writer, errW io.Writer, stdin io.Read
 
 	f, err := parser.Parse(line)
 	if err != nil {
+		if s.unsupportedUsageHandler != nil {
+			syntax := line
+			if len(syntax) > 512 {
+				syntax = syntax[:512]
+			}
+			s.unsupportedUsageHandler(UnsupportedUsage{
+				Kind:   "unknown_syntax",
+				Syntax: syntax,
+				Error:  err.Error(),
+			})
+		}
 		fmt.Fprintf(errW, "parse error: %s\n", err)
 		return 2
 	}
@@ -187,6 +240,9 @@ func (s *Shell) execLine(line string, w io.Writer, errW io.Writer, stdin io.Read
 	var exitCode int
 	for _, stmt := range f.Stmts {
 		exitCode = s.execStmt(stmt, w, errW, stdin)
+		if s.exitRequested {
+			break
+		}
 	}
 	return exitCode
 }
@@ -273,19 +329,33 @@ func (s *Shell) execCall(call *parser.CallExpr, w io.Writer, errW io.Writer, std
 	// commits it as a single atomic whole-object write. Nothing is committed
 	// unless the command succeeds (commit-on-success only — no half-files).
 	if call.Redirect != nil {
+		target := s.expandWord(call.Redirect.Target)
+		// /dev/null is a built-in sink, not a path in the virtual filesystem.
+		// It does not require write capability because it cannot mutate state.
+		if target == "/dev/null" {
+			if call.Redirect.Stderr {
+				return s.execCallInner(call, w, io.Discard, stdin)
+			}
+			return s.execCallInner(call, io.Discard, errW, stdin)
+		}
 		// A file redirect is a write; gate it at parse time (Part B) so a
 		// read-only session cannot use `>`/`>>` to mutate a docset.
 		if !s.ActionAllowed(cmds.ActionWrite) {
-			target := s.expandWord(call.Redirect.Target)
 			fmt.Fprintf(errW, "redirect: %s: read-only filesystem\n", target)
 			return 1
 		}
 		var buf bytes.Buffer
+		if call.Redirect.Stderr {
+			code := s.execCallInner(call, w, &buf, stdin)
+			if redirectCode := cmds.WriteFileMsg(s, errW, "redirect", target, buf.Bytes(), call.Redirect.Append); redirectCode != 0 {
+				return redirectCode
+			}
+			return code
+		}
 		code := s.execCallInner(call, &buf, errW, stdin)
 		if code != 0 {
 			return code
 		}
-		target := s.expandWord(call.Redirect.Target)
 		return cmds.WriteFileMsg(s, errW, "redirect", target, buf.Bytes(), call.Redirect.Append)
 	}
 	return s.execCallInner(call, w, errW, stdin)
@@ -336,6 +406,10 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 		fmt.Fprintln(w, s.cwd)
 		return 0
 	}
+	if cmdName == "exit" || cmdName == "quit" {
+		s.exitRequested = true
+		return 0
+	}
 
 	if fn, ok := cmds.Registry[cmdName]; ok {
 		// Capability gating (Part B): a command whose action the session is
@@ -349,6 +423,9 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 		return fn(s, cmdArgs, w, errW, stdin)
 	}
 
+	if s.unsupportedUsageHandler != nil {
+		s.unsupportedUsageHandler(UnsupportedUsage{Kind: "unknown_command", Command: cmdName})
+	}
 	fmt.Fprintf(errW, "%s: command not found\n", cmdName)
 	fmt.Fprintln(errW, "Type 'help' for available commands.")
 	return 127
@@ -657,22 +734,69 @@ func (s *Shell) globExpand(pattern string) []string {
 	return matches
 }
 
-// RunInteractive runs an interactive shell session.
-// rw is used for both reading input and writing output. When running over
-// an SSH session with an allocated PTY, the session's ptyWriter already
-// converts \n to \r\n, so no additional CRLFWriter wrapping is needed.
+// InteractiveOptions describes terminal properties used by the interactive
+// shell. WidthChanges may be nil. Non-positive widths use an 80-column
+// fallback.
+type InteractiveOptions struct {
+	Width        int
+	WidthChanges <-chan int
+}
+
+// RunInteractive runs an interactive shell session with an 80-column terminal.
 func (s *Shell) RunInteractive(rw io.ReadWriter, errW io.Writer, motd string, prompt string) {
+	s.RunInteractiveWithOptions(rw, errW, motd, prompt, InteractiveOptions{Width: 80})
+}
+
+// RunInteractiveWithOptions runs an interactive shell session. rw is used for
+// both reading input and writing output. When running over an SSH session with
+// an allocated PTY, the session's ptyWriter already converts \n to \r\n, so no
+// additional CRLFWriter wrapping is needed.
+func (s *Shell) RunInteractiveWithOptions(rw io.ReadWriter, errW io.Writer, motd string, prompt string, opts InteractiveOptions) {
 	if motd != "" {
 		fmt.Fprintln(rw, motd)
 		fmt.Fprintln(rw, "")
+	}
+	if opts.Width <= 0 {
+		opts.Width = 80
+	}
+	terminalWidth := opts.Width
+	currentWidth := func() int {
+		for opts.WidthChanges != nil {
+			select {
+			case width, ok := <-opts.WidthChanges:
+				if !ok {
+					opts.WidthChanges = nil
+					return terminalWidth
+				}
+				if width > 0 {
+					terminalWidth = width
+				}
+			default:
+				return terminalWidth
+			}
+		}
+		return terminalWidth
 	}
 
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 1)
 	lastWasCR := false
+	var completionLine string
+	var completionCandidates []completionCandidate
+	var confirmCandidates []completionCandidate
 
 	printPrompt := func() {
 		fmt.Fprintf(rw, "%s:%s $ ", prompt, s.cwd)
+	}
+	redraw := func() {
+		fmt.Fprint(rw, "\r\x1b[2K")
+		printPrompt()
+		rw.Write(buf)
+	}
+	listCandidates := func(candidates []completionCandidate) {
+		fmt.Fprint(rw, "\r\n")
+		fmt.Fprint(rw, formatCandidateColumns(candidates, currentWidth()))
+		redraw()
 	}
 
 	printPrompt()
@@ -695,34 +819,100 @@ func (s *Shell) RunInteractive(rw io.ReadWriter, errW io.Writer, motd string, pr
 		}
 		lastWasCR = ch == '\r'
 
+		if confirmCandidates != nil {
+			switch ch {
+			case 'y', 'Y':
+				fmt.Fprint(rw, string(ch))
+				candidates := confirmCandidates
+				confirmCandidates = nil
+				completionLine = ""
+				completionCandidates = nil
+				listCandidates(candidates)
+			case 'n', 'N', 3:
+				if ch != 3 {
+					fmt.Fprint(rw, string(ch))
+				}
+				confirmCandidates = nil
+				completionLine = ""
+				completionCandidates = nil
+				fmt.Fprint(rw, "\r\n")
+				redraw()
+			default:
+				fmt.Fprint(rw, "\a")
+			}
+			continue
+		}
+
 		switch {
 		case ch == 4: // Ctrl-D
 			fmt.Fprintln(rw, "\r\nGoodbye!")
 			return
 		case ch == 3: // Ctrl-C
 			buf = buf[:0]
+			completionLine = ""
+			completionCandidates = nil
 			fmt.Fprint(rw, "\r\n")
 			printPrompt()
 		case ch == 127 || ch == 8: // Backspace
 			if len(buf) > 0 {
-				buf = buf[:len(buf)-1]
-				rw.Write([]byte("\b \b"))
+				_, size := utf8.DecodeLastRune(buf)
+				buf = buf[:len(buf)-size]
+				completionLine = ""
+				completionCandidates = nil
+				redraw()
 			}
 		case ch == '\r' || ch == '\n':
 			fmt.Fprint(rw, "\r\n")
 			line := strings.TrimSpace(string(buf))
 			buf = buf[:0]
+			completionLine = ""
+			completionCandidates = nil
 			if line == "exit" || line == "quit" {
 				fmt.Fprintln(rw, "Goodbye!")
 				return
 			}
 			if line != "" {
+				s.exitRequested = false
 				s.ExecPipeline(line, rw, rw, nil)
+				if s.exitRequested {
+					fmt.Fprintln(rw, "Goodbye!")
+					return
+				}
 			}
 			printPrompt()
-		case ch == '\t': // Tab — ignore
+		case ch == '\t':
+			line := string(buf)
+			if line == completionLine && len(completionCandidates) > 0 {
+				if len(completionCandidates) > 100 {
+					confirmCandidates = completionCandidates
+					fmt.Fprintf(rw, "\r\nDisplay all %d possibilities? (y or n) ", len(confirmCandidates))
+				} else {
+					listCandidates(completionCandidates)
+				}
+				continue
+			}
+			result := s.complete(line)
+			if len(result.candidates) == 0 {
+				completionLine = ""
+				completionCandidates = nil
+				fmt.Fprint(rw, "\a")
+				continue
+			}
+			if result.line != line {
+				buf = append(buf[:0], result.line...)
+				redraw()
+			}
+			if !result.finished {
+				completionLine = string(buf)
+				completionCandidates = result.candidates
+			} else {
+				completionLine = ""
+				completionCandidates = nil
+			}
 		default:
 			buf = append(buf, ch)
+			completionLine = ""
+			completionCandidates = nil
 			rw.Write([]byte{ch})
 		}
 	}

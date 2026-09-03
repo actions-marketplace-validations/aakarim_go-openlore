@@ -17,56 +17,56 @@ func TestMiddlewareFS_MutationsMapToChangeSets(t *testing.T) {
 		got = op
 		return WriteResult{Hash: "committed"}, nil
 	}
-	m := newMiddlewareFS(mfsReadView{}, Actor{ID: "agent-1"}, admit)
+	m := newMiddlewareFS(mfsReadView{}, Attribution{Principal: "agent-1"}, admit)
 
 	base := "b0"
 	h, err := m.WriteFileAtomic("/w", []byte("hi"), vfs.WriteOpts{IfMatch: &base})
 	if err != nil || h != "committed" {
 		t.Fatalf("write: h=%q err=%v", h, err)
 	}
-	if got.Actor.ID != "agent-1" {
-		t.Fatalf("actor = %+v", got.Actor)
+	if got.Attribution.Principal != "agent-1" {
+		t.Fatalf("attribution = %+v", got.Attribution)
 	}
-	if got.ChangeSet.Action != vfs.ChangeActionWrite || got.ChangeSet.Target != "/w" ||
-		got.ChangeSet.Write == nil || string(got.ChangeSet.Write.Bytes) != "hi" ||
-		got.ChangeSet.Write.Opts.IfMatch == nil || *got.ChangeSet.Write.Opts.IfMatch != "b0" {
-		t.Fatalf("write changeset = %+v", got.ChangeSet)
+	if got.Leaves()[0].Action != vfs.ChangeActionWrite || got.Leaves()[0].Target != "/w" ||
+		got.Leaves()[0].Write == nil || string(got.Leaves()[0].Write.Bytes) != "hi" ||
+		got.Leaves()[0].Write.Opts.IfMatch == nil || *got.Leaves()[0].Write.Opts.IfMatch != "b0" {
+		t.Fatalf("write changeset = %+v", got.Leaves())
 	}
 
 	if err := m.Mkdir("/d"); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if got.ChangeSet.Action != vfs.ChangeActionMkdir || got.ChangeSet.Target != "/d" {
-		t.Fatalf("mkdir changeset = %+v", got.ChangeSet)
+	if got.Leaves()[0].Action != vfs.ChangeActionMkdir || got.Leaves()[0].Target != "/d" {
+		t.Fatalf("mkdir changeset = %+v", got.Leaves())
 	}
 
 	if err := m.MkdirAll("/d/e/f"); err != nil {
 		t.Fatalf("mkdir_all: %v", err)
 	}
-	if got.ChangeSet.Action != vfs.ChangeActionMkdirAll || got.ChangeSet.Target != "/d/e/f" {
-		t.Fatalf("mkdir_all changeset = %+v", got.ChangeSet)
+	if got.Leaves()[0].Action != vfs.ChangeActionMkdirAll || got.Leaves()[0].Target != "/d/e/f" {
+		t.Fatalf("mkdir_all changeset = %+v", got.Leaves())
 	}
 
 	if err := m.Remove("/f"); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if got.ChangeSet.Action != vfs.ChangeActionRemove || got.ChangeSet.Target != "/f" {
-		t.Fatalf("remove changeset = %+v", got.ChangeSet)
+	if got.Leaves()[0].Action != vfs.ChangeActionRemove || got.Leaves()[0].Target != "/f" {
+		t.Fatalf("remove changeset = %+v", got.Leaves())
 	}
 
 	snap := vfs.TreeSnapshot{Root: "/t"}
 	if err := m.RemoveAll("/t", vfs.RemoveOpts{Expected: &snap}); err != nil {
 		t.Fatalf("remove_all: %v", err)
 	}
-	if got.ChangeSet.Action != vfs.ChangeActionRemoveAll || got.ChangeSet.RemoveAll == nil ||
-		got.ChangeSet.RemoveAll.Opts.Expected == nil || got.ChangeSet.RemoveAll.Opts.Expected.Root != "/t" {
-		t.Fatalf("remove_all changeset = %+v", got.ChangeSet)
+	if got.Leaves()[0].Action != vfs.ChangeActionRemoveAll || got.Leaves()[0].RemoveAll == nil ||
+		got.Leaves()[0].RemoveAll.Opts.Expected == nil || got.Leaves()[0].RemoveAll.Opts.Expected.Root != "/t" {
+		t.Fatalf("remove_all changeset = %+v", got.Leaves())
 	}
 }
 
 func TestMiddlewareFS_PendingAndRejectPropagate(t *testing.T) {
 	pending := &vfs.PendingChangeError{Ref: "req-7"}
-	m := newMiddlewareFS(mfsReadView{}, Actor{}, func(_ context.Context, _ WriteOp) (WriteResult, error) {
+	m := newMiddlewareFS(mfsReadView{}, Attribution{}, func(_ context.Context, _ WriteOp) (WriteResult, error) {
 		return WriteResult{}, pending
 	})
 	_, err := m.WriteFileAtomic("/w", []byte("x"), vfs.WriteOpts{})
@@ -76,7 +76,7 @@ func TestMiddlewareFS_PendingAndRejectPropagate(t *testing.T) {
 	}
 
 	boom := errors.New("denied")
-	m2 := newMiddlewareFS(mfsReadView{}, Actor{}, func(_ context.Context, _ WriteOp) (WriteResult, error) {
+	m2 := newMiddlewareFS(mfsReadView{}, Attribution{}, func(_ context.Context, _ WriteOp) (WriteResult, error) {
 		return WriteResult{}, boom
 	})
 	if err := m2.Remove("/x"); !errors.Is(err, boom) {

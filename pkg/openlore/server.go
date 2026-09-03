@@ -1,6 +1,7 @@
 package openlore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,8 +10,12 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aakarim/go-openlore/assets"
@@ -20,6 +25,7 @@ import (
 	"github.com/aakarim/go-openlore/internal/metrics"
 	"github.com/aakarim/go-openlore/internal/passkeys"
 	"github.com/aakarim/go-openlore/internal/skills"
+	"github.com/aakarim/go-openlore/internal/webstyle"
 	"github.com/aakarim/go-openlore/pkg/openlore/meta"
 	"github.com/aakarim/go-openlore/pkg/openlore/validation"
 	"github.com/aakarim/go-openlore/pkg/shell"
@@ -47,6 +53,8 @@ type Server struct {
 	// When true, an access-control policy was loaded and identity scoping is
 	// enforced (docsets filtered, anonymous is read-only).
 	auth         *config.AuthConfig
+	authMu       sync.RWMutex
+	runtimeAuth  atomic.Pointer[config.AuthConfig]
 	authEnforced bool
 	// grants is the registry of grant types (ro/rw + plugin-contributed like
 	// publish). A grant name in lore.json with no registered type fails startup.
@@ -65,7 +73,8 @@ type Server struct {
 	sessionFSFn  SessionFSFn
 
 	// jobs runs async external work (Part D), surfaced read-only at /jobs.
-	jobs *JobManager
+	jobs        *JobManager
+	historyPath string
 
 	// writeLog is the single ordered write log + serialized applier: the sole
 	// writer to the substrate. Non-nil only when the substrate is writable
@@ -81,7 +90,9 @@ type Server struct {
 	// readMW is the read (before-read) middleware contributed by plugins, run in
 	// front of Stat/ReadDir/ReadFile in registration order. Empty in core
 	// go-openlore; when empty no read wrapper is installed (zero read overhead).
-	readMW []ReadMiddleware
+	readMW            []ReadMiddleware
+	contentTransforms []ContentTransform
+	agentSkills       *agentSkillsPlugin
 
 	// metaExtenders are the `lore meta` extenders contributed by plugins,
 	// installed per session in buildSessionShell.
@@ -93,6 +104,7 @@ type Server struct {
 	// the applier after a durable commit (feed emit, post_write hooks) in
 	// registration order. Empty in core go-openlore.
 	postCommitMW []PostCommitMiddleware
+	httpRoutes   []HTTPRouteProvider
 
 	// Bearer-token auth for the MCP + HTTP API (docs/mcp-bearer-auth.md).
 	// identityStore is always set (resolves claims → Identity). The rest are
@@ -102,12 +114,16 @@ type Server struct {
 	issuer             Issuer
 	refreshStore       RefreshTokenStore
 	clientStore        ClientStore
+	cimdResolver       CIMDResolver
+	clientAuth         ClientAuthenticator
 	authCodes          *authCodeStore
 	authorizeReqs      *authorizeStore
+	consents           *consentStore
 	tokens             *tokenEndpoint
 	// oidc verifies external IdP assertions for the jwt-bearer (WIF) grant. It
 	// is non-nil only when oidc_issuers are configured alongside auth.tokens.
-	oidc OIDCVerifier
+	oidc  OIDCVerifier
+	audit AuditLog
 }
 
 // NewServer creates a new OpenLore SSH server.
@@ -146,7 +162,14 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 
 	logger := cfg.Logger
 	if logger == nil {
-		logger = slog.Default()
+		if cfg.Debug {
+			logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		} else {
+			logger = slog.Default()
+		}
+	}
+	for _, warning := range cfg.Warnings() {
+		logger.Warn("ignoring invalid configuration value", "error", warning)
 	}
 
 	s := &Server{
@@ -160,6 +183,11 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 		logger:  logger,
 		motd:    cfg.MOTD,
 	}
+	dataDir := cfg.DataDir
+	if dataDir == "" {
+		dataDir = ".openlore"
+	}
+	s.audit = NewJSONLAuditLog(filepath.Join(dataDir, "audit", "events.jsonl"))
 
 	// Construct shellexec now, but register built-ins after auth/docsets are
 	// loaded so Agent Skills admission can be the outermost write middleware.
@@ -221,8 +249,9 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 	// from the docset that owns the target path. Only registered when at least
 	// one docset carries OKF config.
 	var agentSkills *agentSkillsPlugin
-	if anyDocsetHasAgentSkills(s.auth.Docsets) {
-		agentSkills = newAgentSkills(s.auth.Docsets, s.merge, s.canonicalPath, logger)
+	if cfg.Plugins.Skills.Enabled {
+		agentSkills = newAgentSkills(s.auth.Docsets, s.merge, s.canonicalPath, logger, cfg.Plugins.Skills)
+		s.agentSkills = agentSkills
 		if err := s.registerPlugin(agentSkills); err != nil {
 			return nil, err
 		}
@@ -274,7 +303,13 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 		// so it is the sole writer and gives globally ordered writes/removes. The
 		// applier runs the post-commit chain after each durable commit.
 		s.writeLog = newWriteLog(s.merge, s.postCommitChain(), logger, 0)
+		s.historyPath = filepath.Join(dataDir, "history", "commits.jsonl")
+		s.writeLog.SetCommitRecorder(NewJSONLCommitRecorder(s.historyPath))
 		if agentSkills != nil {
+			agentSkills.submit = func(ctx context.Context, cs vfs.ChangeSet) error {
+				_, err := s.CommitChangeSet(ctx, Attribution{Principal: "agent_skills_remote", internal: true}, cs)
+				return err
+			}
 			s.writeLog.SetPreApply(agentSkills.validateMutation)
 		}
 
@@ -283,7 +318,6 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 		// scoped FS. Only meaningful when writes are possible. Jobs are in-memory
 		// (lost on restart) and surfaced read-only at /jobs.
 		s.jobs = NewJobManager(cfg.MaxJobs, ShellRunner{}, logger)
-		cmds.Jobs = s.jobs
 		s.merge.MountSystem("jobs", NewJobsFS(s.jobs))
 	}
 
@@ -358,6 +392,13 @@ func newServerWithRoot(rootDir string, rootFS, lowerFS vfs.FileSystem, opts ...c
 	return s, nil
 }
 
+func (s *Server) currentAuth() *config.AuthConfig {
+	if auth := s.runtimeAuth.Load(); auth != nil {
+		return auth
+	}
+	return s.auth
+}
+
 // Config returns the resolved configuration.
 func (s *Server) Config() config.Config {
 	return s.config
@@ -396,6 +437,11 @@ func (s *Server) advertisedSSHPort() int {
 		return s.config.ExternalSSHPort
 	}
 	return s.config.Port
+}
+
+func publicKeyMatches(configured string, presented gossh.PublicKey) bool {
+	parsed, _, _, _, err := gossh.ParseAuthorizedKey([]byte(configured))
+	return err == nil && bytes.Equal(parsed.Marshal(), presented.Marshal())
 }
 
 // OnConnect registers a callback for new connections.
@@ -444,15 +490,10 @@ func (s *Server) resolveIdentity(sess ssh.Session) Identity {
 			cert = c
 			matchKey = c.Key
 		}
-		// MarshalAuthorizedKey appends a trailing newline; stored keys are
-		// TrimSpace'd (e.g. by `identity add`). Compare trimmed so the newline
-		// mismatch doesn't silently drop every pubkey match.
-		keyStr := strings.TrimSpace(string(gossh.MarshalAuthorizedKey(matchKey)))
-
 		// First: match by public key. An authenticated key holds the identity's
 		// full authority (shared with token resolution).
-		for _, ident := range s.auth.Identities {
-			if ident.PublicKey != "" && strings.TrimSpace(ident.PublicKey) == keyStr {
+		for _, ident := range s.currentAuth().Identities {
+			if publicKeyMatches(ident.PublicKey, matchKey) {
 				return withConn(conn, s.identityFromAuth(ident))
 			}
 		}
@@ -501,7 +542,7 @@ func (s *Server) resolveHomeDir(homeDocset string) string {
 	if homeDocset == "" {
 		return ""
 	}
-	ds, ok := s.auth.Docsets[homeDocset]
+	ds, ok := s.currentAuth().Docsets[homeDocset]
 	if !ok || len(ds.Paths) == 0 {
 		return ""
 	}
@@ -523,7 +564,7 @@ func (s *Server) writeConflictPolicy(p string) vfs.WriteConflictPolicy {
 		global = vfs.DefaultWriteConflictPolicy
 	}
 	clean := s.canonicalPath(p)
-	for _, ds := range s.auth.Docsets {
+	for _, ds := range s.currentAuth().Docsets {
 		if ds.WriteConflictPolicy == "" {
 			continue
 		}
@@ -612,16 +653,48 @@ func (s *Server) shellHandler(next ssh.Handler) ssh.Handler {
 		ctx := contextWithIdentity(sess.Context(), id)
 		sh := s.shellForContext(ctx)
 
-		cmd := sess.Command()
-		if len(cmd) > 0 {
-			cmdLine := joinCommand(cmd)
+		// Execute the original SSH command string. Session.Command tokenizes it
+		// first and cannot faithfully reconstruct shell operators such as output
+		// redirection, especially when an operator is adjacent to another word.
+		if cmdLine := sess.RawCommand(); cmdLine != "" {
 			s.metrics.TotalCommands.Add(1)
 			exitCode := sh.ExecPipeline(cmdLine, sess, sess.Stderr(), sess)
 			sess.Exit(exitCode)
 			return
 		}
 
-		sh.RunInteractive(sess, sess, s.motd, "lore")
+		interactiveOpts := shell.InteractiveOptions{Width: 80}
+		if pty, windowChanges, ok := sess.Pty(); ok {
+			interactiveOpts.Width = pty.Window.Width
+			widthChanges := make(chan int, 1)
+			interactiveOpts.WidthChanges = widthChanges
+			go func() {
+				defer close(widthChanges)
+				for {
+					select {
+					case window, ok := <-windowChanges:
+						if !ok {
+							return
+						}
+						select {
+						case widthChanges <- window.Width:
+						default:
+							select {
+							case <-widthChanges:
+							default:
+							}
+							select {
+							case widthChanges <- window.Width:
+							default:
+							}
+						}
+					case <-sess.Context().Done():
+						return
+					}
+				}
+			}()
+		}
+		sh.RunInteractiveWithOptions(sess, sess, s.motd, "lore", interactiveOpts)
 		sess.Exit(0)
 	}
 }
@@ -657,21 +730,55 @@ func (s *Server) RegisterPlugin(p any) error {
 // It returns the committed hash (empty for non-write actions) or a CAS/commit
 // error (*vfs.PreconditionError / *vfs.TreeStaleError on drift). If the substrate
 // is read-only (no write log), it returns vfs.ErrReadOnly.
-func (s *Server) CommitChangeSet(ctx context.Context, actor Actor, cs vfs.ChangeSet) (WriteResult, error) {
+func (s *Server) CommitChangeSet(ctx context.Context, attribution Attribution, cs vfs.ChangeSet) (WriteResult, error) {
 	if s.writeLog == nil {
 		return WriteResult{}, vfs.ErrReadOnly
 	}
 	cs = s.canonicalChangeSet(cs)
-	h, err := s.writeLog.Submit(ctx, actor, cs)
+	h, err := s.writeLog.Submit(ctx, attribution, cs)
 	return WriteResult{Hash: h}, err
 }
 
+func (s *Server) AdmitChangeSet(ctx context.Context, id Identity, cs vfs.ChangeSet) (WriteResult, error) {
+	if s.writeLog == nil {
+		return WriteResult{}, vfs.ErrReadOnly
+	}
+	cs = s.canonicalChangeSet(cs)
+	if err := vfs.ValidateChangeSet(cs); err != nil {
+		return WriteResult{}, err
+	}
+	for _, change := range cs.Leaves() {
+		if !s.identityCanWrite(id, change.Action, change.Target) {
+			return WriteResult{}, vfs.ErrReadOnly
+		}
+	}
+	return s.writeChain()(ctx, NewWriteOp(id.attribution(), cs))
+}
+
+type HTTPRouteProvider interface {
+	PrepareHTTPRoutes(*Server) (HTTPRouteRegistrar, error)
+}
+type HTTPRouteRegistrar func(*http.ServeMux)
+type routeExtender struct{ register HTTPRouteRegistrar }
+
+func (e routeExtender) RegisterHTTPHandlers(mux *http.ServeMux) { e.register(mux) }
+
 func (s *Server) canonicalChangeSet(cs vfs.ChangeSet) vfs.ChangeSet {
-	cs.Target = s.canonicalPath(cs.Target)
-	if cs.RemoveAll != nil && cs.RemoveAll.Opts.Expected != nil {
-		remove := *cs.RemoveAll
-		remove.Opts.Expected = copyCanonicalSnapshot(remove.Opts.Expected, s.canonicalPath)
-		cs.RemoveAll = &remove
+	if len(cs.Changes) == 0 {
+		cs.Target = s.canonicalPath(cs.Target)
+		if cs.RemoveAll != nil && cs.RemoveAll.Opts.Expected != nil {
+			remove := *cs.RemoveAll
+			remove.Opts.Expected = copyCanonicalSnapshot(remove.Opts.Expected, s.canonicalPath)
+			cs.RemoveAll = &remove
+		}
+	}
+	for i := range cs.Changes {
+		cs.Changes[i].Target = s.canonicalPath(cs.Changes[i].Target)
+		if cs.Changes[i].RemoveAll != nil && cs.Changes[i].RemoveAll.Opts.Expected != nil {
+			remove := *cs.Changes[i].RemoveAll
+			remove.Opts.Expected = copyCanonicalSnapshot(remove.Opts.Expected, s.canonicalPath)
+			cs.Changes[i].RemoveAll = &remove
+		}
 	}
 	return cs
 }
@@ -705,6 +812,9 @@ func (s *Server) registerPlugin(p any) error {
 	if rp, ok := p.(ReadMiddlewareProvider); ok {
 		s.readMW = append(s.readMW, rp.ReadMiddleware()...)
 	}
+	if tp, ok := p.(ContentTransformProvider); ok {
+		s.contentTransforms = append(s.contentTransforms, tp.ContentTransforms()...)
+	}
 	if pc, ok := p.(PostCommitProvider); ok {
 		s.postCommitMW = append(s.postCommitMW, pc.PostCommitMiddleware()...)
 	}
@@ -729,6 +839,9 @@ func (s *Server) registerPlugin(p any) error {
 		info := ip.Info()
 		s.logger.Info("plugin registered", "name", info.Name, "version", info.Version)
 	}
+	if hp, ok := p.(HTTPRouteProvider); ok {
+		s.httpRoutes = append(s.httpRoutes, hp)
+	}
 	return nil
 }
 
@@ -740,7 +853,7 @@ func (s *Server) registerPlugin(p any) error {
 // chain is just the terminal submit.
 func (s *Server) writeChain() WriteHandler {
 	terminal := func(ctx context.Context, op WriteOp) (WriteResult, error) {
-		h, err := s.writeLog.Submit(ctx, op.Actor, op.ChangeSet)
+		h, err := s.writeLog.Submit(ctx, op.Attribution, op.persistenceChangeSet())
 		return WriteResult{Hash: h}, err
 	}
 	return chainWrite(terminal, s.writeMW...)
@@ -768,22 +881,27 @@ func (s *Server) postCommitChain() PostCommitHandler {
 // OPENLORE_* environment variables. This is the single source of truth for
 // per-identity scoping, shared by the SSH shell handler and the MCP/HTTP tool
 // handlers so all transports enforce the same access rules.
-// buildSessionFS constructs the per-session filesystem for an identity: read
-// scoping to the identity's readable roots, the read/write middleware chains,
-// per-op write authorization by grant, and session CAS tracking. It is the
-// single source of the layered VFS shared by both the interactive shell and the
-// SFTP subsystem so both enforce identical read scoping and write authorization.
+// buildSessionFS constructs the per-session filesystem for an identity and
+// exposes its configured path aliases for filesystem-oriented transports.
 func (s *Server) buildSessionFS(id Identity) vfs.FileSystem {
-	if s.authEnforced && id.policySnapshot == nil {
-		if policy, err := s.currentPolicy(id); err == nil {
-			id.policySnapshot = &policy
-			id.HomeDocset = policy.HomeDocset
-			id.HomeDir = s.resolveHomeDir(policy.HomeDocset)
-		} else {
-			deny := AuthorizationPolicy{}
-			id.policySnapshot = &deny
-		}
+	id = s.resolveSessionIdentity(id)
+	sessionFS := s.buildCanonicalSessionFS(id)
+	// Expose this identity's aliases outermost so callers can retain the alias
+	// spelling while every internal operation, including CAS tracking, sees the
+	// canonical path. Ungranted aliases are never added to the session tree.
+	if aliases := s.aliasesForIdentity(id); len(aliases) > 0 {
+		sessionFS = newAliasFS(sessionFS, aliases)
 	}
+	return sessionFS
+}
+
+// buildCanonicalSessionFS constructs the per-session filesystem without path
+// aliases. The web browser uses this view so its folder tree presents each
+// docset only once; filesystem-oriented transports decorate it with aliases in
+// buildSessionFS.
+func (s *Server) buildCanonicalSessionFS(id Identity) vfs.FileSystem {
+	id = s.resolveSessionIdentity(id)
+
 	// Build per-session filesystem scoped to the identity's readable roots.
 	// Docsets are display-path subtrees of a shared backing filesystem, so read
 	// scoping is by path (not mount name): a session only sees the docsets it
@@ -799,7 +917,7 @@ func (s *Server) buildSessionFS(id Identity) vfs.FileSystem {
 	// abort a read. Innermost read wrapper so it fires for every read that
 	// reaches storage. Only installed when a plugin registered read middleware.
 	if len(s.readMW) > 0 {
-		sessionFS = newReadChainFS(sessionFS, Actor{ID: id.User}, s.readChain())
+		sessionFS = newReadChainFS(sessionFS, id.attribution(), s.readChain())
 	}
 	// Route this session's mutations through the single global ordered log:
 	// every write/mkdir/remove becomes a ChangeSet, runs the admission chain,
@@ -807,7 +925,7 @@ func (s *Server) buildSessionFS(id Identity) vfs.FileSystem {
 	// Innermost writable wrapper, so the outer layers (scope) can deny or defer
 	// a mutation before it ever becomes a log entry.
 	if s.writeLog != nil {
-		sessionFS = newMiddlewareFS(sessionFS, Actor{ID: id.User}, s.writeChain())
+		sessionFS = newMiddlewareFS(sessionFS, id.attribution(), s.writeChain())
 	}
 	// A write-capable session must be a named non-guest identity with full token
 	// scope. The per-operation authorizer below resolves current roles and grants;
@@ -833,6 +951,11 @@ func (s *Server) buildSessionFS(id Identity) vfs.FileSystem {
 	if s.sessionFSFn != nil {
 		sessionFS = s.sessionFSFn(id, sessionFS)
 	}
+	if s.config.AuthFile != "" && id.policySnapshot != nil && scopeGrantsWrite(id.Scopes) && s.hasCapabilityForPolicy(*id.policySnapshot, "lore:config:edit") {
+		if writable, ok := sessionFS.(vfs.WritableFS); ok {
+			sessionFS = &configViewFS{WritableFS: writable, server: s, identity: id, attribution: id.attribution()}
+		}
+	}
 	// Session CAS: track the hash of every file read (and written) so a
 	// later blind overwrite compare-and-swaps against the version the
 	// caller last saw, without naming a hash — an overwrite fails if the
@@ -844,13 +967,38 @@ func (s *Server) buildSessionFS(id Identity) vfs.FileSystem {
 			sessionFS = newReadTrackingFS(w)
 		}
 	}
-	// Expose this identity's aliases outermost so callers can retain the alias
-	// spelling while every internal operation, including CAS tracking, sees the
-	// canonical path. Ungranted aliases are never added to the session tree.
-	if aliases := s.aliasesForIdentity(id); len(aliases) > 0 {
-		sessionFS = newAliasFS(sessionFS, aliases)
+	// Presentation-only transforms must be outside tracking: tracked hashes are
+	// hashes of durable bytes, never injected status annotations.
+	if len(s.contentTransforms) > 0 {
+		if writable, ok := sessionFS.(vfs.WritableFS); ok {
+			sessionFS = &writableReadTransformFS{WritableFS: writable, transforms: s.contentTransforms}
+		} else {
+			sessionFS = &readTransformFS{FileSystem: sessionFS, transforms: s.contentTransforms}
+		}
+		if s.agentSkills != nil {
+			switch transformed := sessionFS.(type) {
+			case *writableReadTransformFS:
+				transformed.updateRemoteSkill = s.agentSkills.updateRemoteSkill
+			case *readTransformFS:
+				transformed.updateRemoteSkill = s.agentSkills.updateRemoteSkill
+			}
+		}
 	}
 	return sessionFS
+}
+
+func (s *Server) resolveSessionIdentity(id Identity) Identity {
+	if s.authEnforced && id.policySnapshot == nil {
+		if policy, err := s.currentPolicy(id); err == nil {
+			id.policySnapshot = &policy
+			id.HomeDocset = policy.HomeDocset
+			id.HomeDir = s.resolveHomeDir(policy.HomeDocset)
+		} else {
+			deny := AuthorizationPolicy{}
+			id.policySnapshot = &deny
+		}
+	}
+	return id
 }
 
 func (s *Server) buildSessionShell(id Identity) *shell.Shell {
@@ -870,8 +1018,24 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 	// again at invocation. Guest, read-scoped, and currently read-only sessions
 	// do not see write verbs.
 	canWrite := s.authEnforced && id.IdentityName != "" && id.IdentityName != "guest" && len(s.writableDocsetNames(id)) > 0
+	canAdmin := s.authEnforced && id.policySnapshot != nil && scopeGrantsWrite(id.Scopes) && s.hasCapabilityForPolicy(*id.policySnapshot, "lore:config:edit")
 
 	sh := shell.NewShell(sessionFS)
+	if s.config.Debug {
+		sh.SetUnsupportedUsageHandler(func(usage shell.UnsupportedUsage) {
+			attrs := []any{"kind", usage.Kind}
+			if usage.Command != "" {
+				attrs = append(attrs, "command", usage.Command)
+			}
+			if usage.Syntax != "" {
+				attrs = append(attrs, "syntax", usage.Syntax, "error", usage.Error)
+			}
+			if id.IdentityName != "" {
+				attrs = append(attrs, "identity", id.IdentityName)
+			}
+			s.logger.Debug("unsupported shell usage", attrs...)
+		})
+	}
 	if s.config.DefaultCwd != "" {
 		sh.SetCwd(s.config.DefaultCwd)
 	}
@@ -884,21 +1048,35 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 	// an unrecognized/guest identity is read-only; a recognized
 	// identity may write and publish within its docsets.
 	if s.authEnforced {
-		if canWrite {
-			allowed := []cmds.Action{cmds.ActionWrite, cmds.ActionPublish}
+		if canWrite || canAdmin {
+			allowed := []cmds.Action{}
+			if canWrite {
+				allowed = append(allowed, cmds.ActionWrite, cmds.ActionPublish)
+			} else if canAdmin {
+				allowed = append(allowed, cmds.ActionWrite)
+			}
 			// spawn runs an external command as the OpenLore service
 			// user, so it's gated on an explicit `spawn` capability
 			// (Part D) — never granted to ordinary writers.
 			if s.hasCapabilityForPolicy(*id.policySnapshot, "spawn") {
 				allowed = append(allowed, cmds.ActionSpawn)
 			}
+			if canAdmin {
+				allowed = append(allowed, cmds.ActionAdmin)
+			}
 			sh.SetAllowedActions(allowed)
 		} else {
 			sh.SetAllowedActions(nil) // read-only (ActionRead implied)
 		}
 		sh.SetActionAuthorizer(func(action cmds.Action) bool {
+			if action == cmds.ActionWrite && !canWrite {
+				return s.hasCurrentCapability(id, "lore:config:edit")
+			}
 			if action == cmds.ActionSpawn {
 				return s.hasCurrentCapability(id, "spawn")
+			}
+			if action == cmds.ActionAdmin {
+				return s.hasCurrentCapability(id, "lore:config:edit")
 			}
 			return true
 		})
@@ -907,14 +1085,31 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 	// Per-session docset views for `lore docsets` and publish inboxes for
 	// `publish`. Computed once here, where the access authority lives.
 	sh.SetDocsets(s.sessionDocsets(id))
+	sh.SetSkillsManagementEnabled(s.config.Plugins.Skills.Enabled)
+	sh.SetSkillsRemoteConfig(s.config.Plugins.Skills.RemoteTimeout, s.config.Plugins.Skills.RemoteMaxBytes)
 	sh.SetMetaFilters(s.sessionMetaFilters(id))
 	sh.SetPublishTargets(s.sessionPublishTargets(id))
 	sh.SetMetaExtenders(s.metaExtenders)
 	sh.SetValidators(s.validators)
+	a := id.attribution()
+	sh.SetCommandAttribution(cmds.JobAttribution{Principal: a.Principal, Actor: a.Actor, ClientAuth: string(a.ClientAuth)})
+	if canAdmin {
+		sh.SetConfigReloadBackend(s)
+	}
+	if s.historyPath != "" {
+		sh.SetHistoryBackend(fileHistory{path: s.historyPath, roots: historyRoots(s.sessionDocsets(id))})
+	}
+	sh.SetJobBackend(s.jobs)
 
 	// Set identity info as environment variables
 	if id.IdentityName != "" {
 		sh.SetEnv("OPENLORE_IDENTITY", id.IdentityName)
+	}
+	if id.Attribution.Actor != "" {
+		sh.SetEnv("OPENLORE_ACTOR", id.Attribution.Actor)
+	}
+	if id.Attribution.ClientAuth != "" {
+		sh.SetEnv("OPENLORE_CLIENT_AUTH", string(id.Attribution.ClientAuth))
 	}
 	// $HOME points at the identity's home docset (enables ~ expansion and
 	// `cd` with no arguments).
@@ -938,8 +1133,8 @@ func (s *Server) buildSessionShell(id Identity) *shell.Shell {
 func (s *Server) sessionDocsets(id Identity) []cmds.DocsetInfo {
 	writable := s.writableDocsetNames(id)
 	var out []cmds.DocsetInfo
-	for name := range s.auth.Docsets {
-		ds, ok := s.auth.Docsets[name]
+	for name := range s.currentAuth().Docsets {
+		ds, ok := s.currentAuth().Docsets[name]
 		if !ok {
 			continue
 		}
@@ -960,7 +1155,7 @@ func (s *Server) sessionDocsets(id Identity) []cmds.DocsetInfo {
 				Writable:    writable[name],
 				Home:        i == 0 && name == id.HomeDocset,
 				Inbox:       inboxPath(ds) != "",
-				AgentSkills: ds.AgentSkills,
+				AgentSkills: directMarker(s.merge, s.canonicalPath(displayPath(pm))),
 			})
 		}
 		target := primaryDisplayPath(ds)
@@ -972,12 +1167,24 @@ func (s *Server) sessionDocsets(id Identity) []cmds.DocsetInfo {
 				Grants:      grantNames,
 				Grant:       legacyGrant,
 				Writable:    writable[name],
-				AgentSkills: ds.AgentSkills,
+				AgentSkills: directMarker(s.merge, s.canonicalPath(target)),
 			})
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+func directMarker(fsys vfs.FileSystem, p string) bool {
+	if fsys == nil || (reflect.ValueOf(fsys).Kind() == reflect.Ptr && reflect.ValueOf(fsys).IsNil()) {
+		return false
+	}
+	x, ok := fsys.(vfs.XattrReader)
+	if !ok {
+		return false
+	}
+	b, err := x.GetXattr(p, agentSkillsMarker)
+	return err == nil && len(b) == 0
 }
 
 func (s *Server) sessionMetaFilters(id Identity) []meta.Filter {
@@ -986,7 +1193,7 @@ func (s *Server) sessionMetaFilters(id Identity) []meta.Filter {
 		nf := f
 		nf.Roots = nil
 		seen := map[string]bool{}
-		for docsetName, ds := range s.auth.Docsets {
+		for docsetName, ds := range s.currentAuth().Docsets {
 			grantNames, accessible := s.effectiveGrantNames(id, docsetName)
 			if !accessible {
 				continue
@@ -1027,8 +1234,8 @@ func (s *Server) sessionPublishTargets(id Identity) []cmds.PublishTarget {
 		return nil
 	}
 	var out []cmds.PublishTarget
-	for name := range s.auth.Docsets {
-		ds, ok := s.auth.Docsets[name]
+	for name := range s.currentAuth().Docsets {
+		ds, ok := s.currentAuth().Docsets[name]
 		if !ok {
 			continue
 		}
@@ -1066,7 +1273,7 @@ func (s *Server) writableDocsetNames(id Identity) map[string]bool {
 		return out // global lock closed: nothing is writable
 	}
 	if !s.authEnforced {
-		for name := range s.auth.Docsets {
+		for name := range s.currentAuth().Docsets {
 			out[name] = true
 		}
 		return out
@@ -1074,8 +1281,8 @@ func (s *Server) writableDocsetNames(id Identity) map[string]bool {
 	if id.IdentityName == "" || !scopeGrantsWrite(id.Scopes) {
 		return out
 	}
-	for name := range s.auth.Docsets {
-		ds, ok := s.auth.Docsets[name]
+	for name := range s.currentAuth().Docsets {
+		ds, ok := s.currentAuth().Docsets[name]
 		if !ok {
 			continue
 		}
@@ -1106,6 +1313,7 @@ func (s *Server) anonymousIdentity() Identity {
 	}
 	if s.authEnforced {
 		id.IdentityName = "guest"
+		id.Attribution = Attribution{Principal: "guest"}
 		id.Principal = AuthenticatedPrincipal{Subject: "guest", IdentityName: "guest", Source: "guest"}
 		id.Scopes = []string{ScopeFull}
 	} else {
@@ -1145,26 +1353,20 @@ func (s *Server) shellForContext(ctx context.Context) *shell.Shell {
 	return s.buildSessionShell(s.identityFromContext(ctx))
 }
 
-func joinCommand(parts []string) string {
-	result := ""
-	for i, p := range parts {
-		if i > 0 {
-			result += " "
-		}
-		// Re-quote args that contain shell metacharacters (SSH splits on spaces)
-		if strings.ContainsAny(p, " \t") {
-			result += "'" + strings.ReplaceAll(p, "'", "'\\''") + "'"
-		} else {
-			result += p
-		}
-	}
-	return result
-}
-
 // ListenAndServe starts the SSH server (blocks).
 func (s *Server) ListenAndServe() error {
 	if err := s.validateGrants(); err != nil {
 		return err
+	}
+	preparedRoutes := make([]HTTPRouteRegistrar, 0, len(s.httpRoutes))
+	if s.config.HTTPPort > 0 {
+		for _, provider := range s.httpRoutes {
+			register, err := provider.PrepareHTTPRoutes(s)
+			if err != nil {
+				return err
+			}
+			preparedRoutes = append(preparedRoutes, register)
+		}
 	}
 	opts := []ssh.Option{
 		wish.WithAddress(fmt.Sprintf(":%d", s.config.Port)),
@@ -1204,12 +1406,8 @@ func (s *Server) ListenAndServe() error {
 					matchKey = c.Key
 				}
 
-				// MarshalAuthorizedKey appends a trailing newline; stored keys
-				// are TrimSpace'd. Compare trimmed so a valid key isn't denied
-				// admission before resolveIdentity ever runs.
-				keyStr := strings.TrimSpace(string(gossh.MarshalAuthorizedKey(matchKey)))
-				for _, ident := range s.auth.Identities {
-					if ident.PublicKey != "" && strings.TrimSpace(ident.PublicKey) == keyStr {
+				for _, ident := range s.currentAuth().Identities {
+					if publicKeyMatches(ident.PublicKey, matchKey) {
 						return true
 					}
 				}
@@ -1277,13 +1475,14 @@ func (s *Server) ListenAndServe() error {
 		webFS := assets.Web()
 		if webFS != nil {
 			httpCfg := httpserver.Config{
-				Port:          s.config.HTTPPort,
-				TLSCert:       s.config.TLSCert,
-				TLSKey:        s.config.TLSKey,
-				HostKeyPath:   s.config.HostKeyPath,
-				SSHPort:       s.advertisedSSHPort(),
-				Logger:        s.logger,
-				ExtraHandlers: map[string]http.Handler{},
+				Port:           s.config.HTTPPort,
+				TLSCert:        s.config.TLSCert,
+				TLSKey:         s.config.TLSKey,
+				ClientCABundle: s.config.MTLS.CABundle,
+				HostKeyPath:    s.config.HostKeyPath,
+				SSHPort:        s.advertisedSSHPort(),
+				Logger:         s.logger,
+				ExtraHandlers:  map[string]http.Handler{},
 			}
 
 			// Third-party license notices, served from the embedded legal
@@ -1295,6 +1494,15 @@ func (s *Server) ListenAndServe() error {
 				httpCfg.ExtraHandlers["/legal/"] = legalHandler
 				s.logger.Info("legal notices mounted", "path", "/legal", "http_port", s.config.HTTPPort)
 			}
+			httpCfg.ExtraHandlers["/assets/openlore.css"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+				w.Header().Set("Content-Type", "text/css; charset=utf-8")
+				w.Header().Set("Cache-Control", "public, max-age=3600")
+				_, _ = w.Write(webstyle.CSS)
+			})
 
 			// A single MCP server backs both the Streamable HTTP endpoint and
 			// the plain JSON HTTP API below. Its `shell` tool builds a
@@ -1302,7 +1510,11 @@ func (s *Server) ListenAndServe() error {
 			// callers get the same lore/capability scoping as an SSH session.
 			var mcpServer *mcp.Server
 			if (s.config.MCPEnabled && s.config.MCPPath != "") || (s.config.APIEnabled && s.config.APIPath != "") {
-				mcpServer = NewMCPServer(s.fs, withMCPShellFactory(s.shellForContext))
+				mcpServer = NewMCPServer(
+					s.fs,
+					WithMCPReadOnly(s.config.Readonly),
+					withMCPShellFactory(s.shellForContext),
+				)
 			}
 
 			// Mount the MCP-over-HTTP (Streamable HTTP) endpoint on the HTTP
@@ -1327,7 +1539,7 @@ func (s *Server) ListenAndServe() error {
 			// endpoints: POST {path}/shell and GET {path}/commands.
 			if s.config.APIEnabled && s.config.APIPath != "" {
 				apiPath := "/" + strings.Trim(s.config.APIPath, "/")
-				api := NewMCPHTTPAPI(mcpServer)
+				api := NewMCPHTTPAPI(mcpServer, s.shellForContext)
 				httpCfg.ExtraHandlers[apiPath+"/"] = s.authMiddleware(api.Handler(apiPath), !s.config.AllowKeyless)
 				s.logger.Info("HTTP API mounted", "path", apiPath, "http_port", s.config.HTTPPort)
 			}
@@ -1343,6 +1555,9 @@ func (s *Server) ListenAndServe() error {
 				s.logger.Info("authorize endpoint mounted", "path", authorizePath, "http_port", s.config.HTTPPort)
 				s.logger.Info("client registration mounted", "path", registrationPath, "http_port", s.config.HTTPPort)
 				s.logger.Info("oauth metadata mounted", "path", protectedResourceMetadataPath, "http_port", s.config.HTTPPort)
+			}
+			for _, register := range preparedRoutes {
+				httpCfg.Extenders = append(httpCfg.Extenders, routeExtender{register: register})
 			}
 
 			if s.passkeys != nil {
@@ -1376,6 +1591,9 @@ func (s *Server) ListenAndServe() error {
 				s.passkeys.SetTokenIssuer(s)
 
 				httpCfg.Extenders = append(httpCfg.Extenders, s.passkeys)
+				httpCfg.ExtraHandlers[permissionsPath] = http.HandlerFunc(s.handlePermissionsPage)
+				httpCfg.ExtraHandlers[permissionsUpdatePath] = http.HandlerFunc(s.handleDelegateUpdate)
+				httpCfg.ExtraHandlers[permissionsRemovePath] = http.HandlerFunc(s.handleDelegateRemove)
 
 				lorePath := s.config.Passkeys.LorePath
 				if lorePath == "" {
@@ -1383,22 +1601,45 @@ func (s *Server) ListenAndServe() error {
 				}
 				lorePath = "/" + strings.Trim(lorePath, "/")
 				// The /lore web browser reads through the same per-identity
-				// scoped session FS as every other transport, so docset
+				// scoped canonical FS as every other transport, so docset
 				// boundaries (including nested-docset carve-outs) are enforced
-				// identically. An unresolved identity falls back to the
-				// anonymous/default authority.
+				// identically, without exposing filesystem path aliases in the
+				// human-facing folder tree. An unresolved identity falls back to
+				// the anonymous/default authority.
 				httpCfg.ExtraHandlers[lorePath+"/"] = s.passkeys.LoreBrowserHandler(func(name string) vfs.FileSystem {
 					id, ok := s.identityForName(name)
 					if !ok {
 						id = s.anonymousIdentity()
 					}
-					return s.buildSessionFS(id)
+					return s.buildCanonicalSessionFS(id)
+				}, func(name, filePath string) ([]passkeys.FileHistoryEntry, error) {
+					if s.historyPath == "" {
+						return nil, nil
+					}
+					id, ok := s.identityForName(name)
+					if !ok {
+						id = s.anonymousIdentity()
+					}
+					entries, err := (fileHistory{path: s.historyPath, roots: historyRoots(s.sessionDocsets(id))}).QueryFile(filePath)
+					if err != nil {
+						return nil, err
+					}
+					history := make([]passkeys.FileHistoryEntry, len(entries))
+					for i, entry := range entries {
+						history[i] = passkeys.FileHistoryEntry{
+							Time: entry.Time, Attribution: entry.Attribution, Action: entry.Action, Hash: entry.Hash,
+						}
+					}
+					return history, nil
 				})
 
 				cmds.PublishBaseURL = baseURL + lorePath
 			}
 
-			httpSrv := httpserver.New(webFS, httpCfg)
+			httpSrv, err := httpserver.New(webFS, httpCfg)
+			if err != nil {
+				return fmt.Errorf("creating HTTP server: %w", err)
+			}
 			httpSrv.Start()
 			s.httpSrv = httpSrv
 		}
