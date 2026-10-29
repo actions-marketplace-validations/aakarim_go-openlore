@@ -3,13 +3,54 @@ package cmds
 import (
 	"fmt"
 	"io"
+	"slices"
+	"strings"
 )
 
 func CmdHelp(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	if len(args) > 1 {
+		fmt.Fprintln(errW, "usage: help [command]")
+		return 2
+	}
+	if len(args) == 1 {
+		// Filter the same capability-scoped catalogue used by bare help, so
+		// command entries and their continuation lines stay in one place.
+		var catalogue strings.Builder
+		CmdHelp(ctx, nil, &catalogue, errW, stdin)
+		// These three commands are handled directly by Shell.execArgs,
+		// rather than registered in the command catalogue.
+		known := IsKnown(args[0]) || slices.Contains([]string{"pwd", "exit", "quit"}, args[0])
+		matched, found := false, false
+		for _, line := range strings.Split(catalogue.String(), "\n") {
+			if !strings.HasPrefix(line, "    ") {
+				matched = false
+				if known && strings.HasPrefix(line, "  ") {
+					usage, _, _ := strings.Cut(strings.TrimSpace(line), "  ")
+					for _, form := range strings.Split(usage, " / ") {
+						name := strings.Fields(form)[0]
+						if slices.Contains(strings.Split(name, "/"), args[0]) {
+							matched = true
+						}
+					}
+				}
+			}
+			if matched {
+				fmt.Fprintln(w, line)
+				found = true
+			}
+		}
+		if !found {
+			fmt.Fprintf(errW, "help: no entry for %s\n", args[0])
+			return 1
+		}
+		return 0
+	}
+
 	fmt.Fprintln(w, "Available commands:")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "FILESYSTEM")
 	fmt.Fprintln(w, "  ls [-l|-a|-R|-S|-t|-F|-1|-h|-d] [path]  List directory contents")
+	fmt.Fprintln(w, "    -R recursive; -S by size; -t by time; -h human sizes; -d dir itself")
 	fmt.Fprintln(w, "  cat [-n|-A] <file>                      Display file contents")
 	fmt.Fprintln(w, "  head [-n N|-c N] <file>                 Display first N lines (default 10)")
 	fmt.Fprintln(w, "  tail [-n N|-c N|+N] <file>              Display last N lines (default 10)")
@@ -20,15 +61,20 @@ func CmdHelp(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 	fmt.Fprintln(w, "  diff [-u|-q] <file1> <file2>             Compare two files")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "SEARCH")
-	fmt.Fprintln(w, "  grep [-inrvcloLwxm] <pattern> [path]    Search for pattern in files")
-	fmt.Fprintln(w, "  find [path] [-name pat] [-type f|d]     Find files")
+	fmt.Fprintln(w, "  grep [-EFinrRohcvl] <pattern> [path]    Search for pattern in files")
+	fmt.Fprintln(w, "    Basic regex by default; -E extended regex; -F fixed strings; use -E 'a|b' for multiple patterns")
+	fmt.Fprintln(w, "  find [-L] [path] [-name pat] [-type f|d|l] Find files (-L follows aliases)")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "TEXT PROCESSING")
 	fmt.Fprintln(w, "  sort [-r|-n|-u|-f|-k N|-t SEP]          Sort lines")
 	fmt.Fprintln(w, "  uniq [-c|-d|-i|-u]                       Filter duplicate lines")
 	fmt.Fprintln(w, "  cut [-d DEL|-f FIELDS|-c CHARS|-s]       Cut sections from lines")
 	fmt.Fprintln(w, "  sed [-n|-e EXPR] 's/pat/repl/flags'      Stream editor")
-	fmt.Fprintln(w, "  sed '/pat/a\\<text>' <file>              Append text after matching lines")
+	fmt.Fprintln(w, "    Commands: s (flags g, i, I), a, d, p; any other command is an error")
+	fmt.Fprintln(w, "    Replacement escapes: \\n newline, \\t tab, \\\\ backslash")
+	fmt.Fprintln(w, "    Escape delimiters with a backslash; backslash-newline inserts a newline")
+	fmt.Fprintln(w, "  sed '/pat/a text' <file>                  Append text after matching lines")
+	fmt.Fprintln(w, "  sed '/pat/a\\<text>' <file>              Append text, preserving leading whitespace")
 	fmt.Fprintln(w, "  awk [-F SEP|-v VAR=VAL] 'program'        Pattern scanning")
 	fmt.Fprintln(w, "  tr [-d|-s|-c] SET1 [SET2]                Translate characters")
 	fmt.Fprintln(w, "  rev                                      Reverse each line")
@@ -66,6 +112,8 @@ func CmdHelp(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 	if ctx.ActionAllowed(ActionWrite) {
 		fmt.Fprintln(w, "WRITES")
 		fmt.Fprintln(w, "  cmd > file  /  cmd >> file               Redirect output to a file")
+		fmt.Fprintln(w, "  cat <<'EOF' > file ... EOF               Write a multi-line file (heredoc)")
+		fmt.Fprintln(w, "    Put the body on following lines and EOF alone on the final line")
 		fmt.Fprintln(w, "  tee <file>                               Pass stdin to stdout and a file")
 		fmt.Fprintln(w, "  patch <file>                             Apply a unified diff (atomic)")
 		fmt.Fprintln(w, "  sed -i 's/a/b/' <file>                   Edit a file in place")
@@ -102,7 +150,14 @@ func CmdHelp(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdin i
 	fmt.Fprintln(w, "  source <file> / eval <cmd>               Execute commands")
 	fmt.Fprintln(w, "  help                                     Show this help")
 	fmt.Fprintln(w, "  exit / quit                              Close session")
+	fmt.Fprintln(w, "  Unquoted * and ? globs expand; bare patterns use the current directory")
 	fmt.Fprintln(w, "")
+	if analyticsService(ctx) != nil {
+		fmt.Fprintln(w, "ANALYTICS (operator-only)")
+		fmt.Fprintln(w, "  analytics list|show <name>|status|...    Instance-wide usage analytics; analytics help for usage")
+		fmt.Fprintln(w, "    Requires lore:analytics:admin and full token scope; docset readers use the web dashboard")
+		fmt.Fprintln(w, "")
+	}
 	fmt.Fprintln(w, "AGENT SKILLS")
 	fmt.Fprintln(w, "  skills                                   Show Agent Skills usage and installed instructions")
 	fmt.Fprintln(w, "")

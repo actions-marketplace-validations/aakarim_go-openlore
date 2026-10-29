@@ -1,0 +1,244 @@
+package analytics
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func testFactsIndex(t *testing.T) (*SQLiteAggregationStore, FactsIndex) {
+	t.Helper()
+	store, err := OpenSQLiteAggregationStore(t.TempDir() + "/aggregations.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store, newSQLiteFactsIndex(store)
+}
+
+func TestFactsIndexLookupMetadataAndSources(t *testing.T) {
+	_, index := testFactsIndex(t)
+	ctx := context.Background()
+	fact := IndexedFacts{Path: "/a.md", Size: 4, MTimeNS: 10, ContentHash: "one", Sources: map[string]map[string]float64{"size": {"bytes": 4}}}
+	if err := index.Upsert(ctx, fact); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, err := index.Lookup(ctx, "/a.md", 4, 10, []string{"size"}); err != nil || !hit {
+		t.Fatalf("matching row was not a hit: hit=%v err=%v", hit, err)
+	}
+	if _, hit, _ := index.Lookup(ctx, "/a.md", 4, 11, []string{"size"}); hit {
+		t.Fatal("same size with new mtime was a hit")
+	}
+	if _, hit, _ := index.Lookup(ctx, "/a.md", 4, 10, []string{"size", "new-tokenizer"}); hit {
+		t.Fatal("row missing an active source was a hit")
+	}
+}
+
+func TestFactsIndexChangedHashDropsInactiveScalars(t *testing.T) {
+	store, index := testFactsIndex(t)
+	ctx := context.Background()
+	if err := index.Upsert(ctx, IndexedFacts{Path: "/a.md", Size: 3, MTimeNS: 1, ContentHash: "old", Sources: map[string]map[string]float64{"old-tokenizer": {"tokens": 99}, "size": {"bytes": 3}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Upsert(ctx, IndexedFacts{Path: "/a.md", Size: 3, MTimeNS: 2, ContentHash: "new", Sources: map[string]map[string]float64{"size": {"bytes": 3}}}); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT count(*) FROM file_scalars WHERE path=? AND source=?`, "/a.md", "old-tokenizer").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("stale source count=%d err=%v", count, err)
+	}
+}
+
+func TestFactsIndexReplacesInactiveScalarsWhenHashUnchanged(t *testing.T) {
+	_, index := testFactsIndex(t)
+	ctx := context.Background()
+	first := IndexedFacts{Path: "/a.md", Size: 3, MTimeNS: 1, ContentHash: "same", Sources: map[string]map[string]float64{"old": {"tokens": 1}}}
+	if err := index.Upsert(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	first.MTimeNS = 2
+	first.Sources = map[string]map[string]float64{"new": {"tokens": 2}}
+	if err := index.Upsert(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	got, hit, err := index.Lookup(ctx, "/a.md", 3, 2, []string{"new"})
+	if err != nil || !hit || len(got.Sources["old"]) != 0 || got.Sources["new"]["tokens"] != 2 {
+		t.Fatalf("inactive scalar was retained: %#v hit=%v err=%v", got.Sources, hit, err)
+	}
+}
+
+func TestFactsIndexPrefixScanAndPrune(t *testing.T) {
+	_, index := testFactsIndex(t)
+	ctx := context.Background()
+	for _, p := range []string{"/docs/a.md", "/docs/nested/b.md", "/other.md"} {
+		if err := index.Upsert(ctx, IndexedFacts{Path: p, Size: 1, MTimeNS: 1, ContentHash: p, ComputedAt: time.Now(), Sources: map[string]map[string]float64{"size": {"bytes": 1}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := index.PrefixScan(ctx, "/docs")
+	if err != nil || len(rows) != 2 || rows[0].Sources["size"]["bytes"] != 1 {
+		t.Fatalf("prefix rows=%v err=%v", rows, err)
+	}
+	if err := index.Prune(ctx, map[string]struct{}{rows[0].Path: {}, rows[1].Path: {}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, err := index.Lookup(ctx, "/other.md", 1, 1, []string{"size"}); err != nil || hit {
+		t.Fatalf("pruned row hit=%v err=%v", hit, err)
+	}
+}
+
+func TestFactsScanQueueResumesSameScopeGeneration(t *testing.T) {
+	_, index := testFactsIndex(t)
+	ctx := context.Background()
+	scopes := []KnowledgeScope{{Name: "docs", Root: "/docs"}}
+	generation, err := index.StartScan(ctx, scopes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.CompleteScanPath(ctx, generation, "/docs", []string{"/docs/a.md", "/docs/b.md"}, false); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := index.StartScan(ctx, scopes)
+	if err != nil || resumed != generation {
+		t.Fatalf("resumed generation=%d want=%d err=%v", resumed, generation, err)
+	}
+	paths, err := index.NextScanPaths(ctx, resumed, 10)
+	if err != nil || len(paths) != 2 {
+		t.Fatalf("durable queue=%v err=%v", paths, err)
+	}
+	// Replayed completions must not inflate the durable progress counters.
+	for range 2 {
+		if err := index.CompleteScanPath(ctx, generation, "/docs/a.md", nil, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A process that stops mid-scan leaves the generation updating; the next
+	// start resumes its queue and progress.
+	if resumed, err := index.StartScan(ctx, scopes); err != nil || resumed != generation {
+		t.Fatalf("interrupted generation=%d want=%d err=%v", resumed, generation, err)
+	}
+	state, err := index.ScanState(ctx)
+	if err != nil || state.State != "updating" || state.Processed != 2 || state.Skipped != 1 {
+		t.Fatalf("resumed progress=%+v err=%v", state, err)
+	}
+	if _, err := index.StartScan(ctx, []KnowledgeScope{{Name: "other", Root: "/other"}}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = index.ScanState(ctx)
+	if err != nil || state.Processed != 0 || state.Skipped != 0 {
+		t.Fatalf("new scan did not reset progress=%+v err=%v", state, err)
+	}
+}
+
+func TestFactsScanFailedGenerationRestartsFromScopeRoots(t *testing.T) {
+	_, index := testFactsIndex(t)
+	ctx := context.Background()
+	scopes := []KnowledgeScope{{Name: "docs", Root: "/docs"}, {Name: "notes", Root: "/notes"}}
+	first, err := index.StartScan(ctx, scopes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.CompleteScanPath(ctx, first, "/docs", []string{"/docs/a.md"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.CompleteScanPath(ctx, first, "/notes", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Upsert(ctx, IndexedFacts{Path: "/docs/a.md", Owner: "docs", Generation: first, Sources: map[string]map[string]float64{"size": {"bytes": 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.CompleteScanPath(ctx, first, "/docs/a.md", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if complete, err := index.FinishScan(ctx, first); err != nil || !complete {
+		t.Fatalf("finish complete=%v err=%v", complete, err)
+	}
+	// Later work queues a path that can never be indexed and fails the scan.
+	if err := index.QueueScanPath(ctx, first, "/docs/broken.md"); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.FailScan(ctx, first, errors.New("index /docs/broken.md: permission denied")); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := index.StartScan(ctx, scopes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted <= first {
+		t.Fatalf("failed scan resumed generation %d (first %d)", restarted, first)
+	}
+	if paths, err := index.NextScanPaths(ctx, restarted, 10); err != nil || len(paths) != 2 || paths[0] != "/docs" || paths[1] != "/notes" {
+		t.Fatalf("restarted queue=%v err=%v, want scope roots", paths, err)
+	}
+	if paths, err := index.NextScanPaths(ctx, first, 10); err != nil || len(paths) != 0 {
+		t.Fatalf("failed generation queue survived: %v err=%v", paths, err)
+	}
+	state, err := index.ScanState(ctx)
+	if err != nil || state.State != "updating" || state.Error != "" || state.Processed != 0 || state.Skipped != 0 || !state.ScopeCompatible {
+		t.Fatalf("restarted state=%+v err=%v", state, err)
+	}
+	// The last completed generation stays readable while the rebuild runs.
+	if rows, err := index.PrefixScan(ctx, "/docs"); err != nil || len(rows) != 1 || rows[0].Generation != first {
+		t.Fatalf("committed rows during rebuild=%v err=%v", rows, err)
+	}
+	if again, err := index.StartScan(ctx, scopes); err != nil || again != restarted {
+		t.Fatalf("interrupted rebuild generation=%d want=%d err=%v", again, restarted, err)
+	}
+}
+
+func TestFactsScanSourcesAndStaleGeneration(t *testing.T) {
+	_, index := testFactsIndex(t)
+	ctx := context.Background()
+	scopes := []KnowledgeScope{{Name: "docs", Root: "/docs"}}
+	first, err := index.StartScan(ctx, scopes, "size", "approx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.CompleteScanPath(ctx, first, "/docs", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if complete, err := index.FinishScan(ctx, first); err != nil || !complete {
+		t.Fatalf("finish complete=%v err=%v", complete, err)
+	}
+	if reused, err := index.StartScan(ctx, scopes, "approx", "size"); err != nil || reused != first {
+		t.Fatalf("same sources generation=%d want=%d err=%v", reused, first, err)
+	}
+	second, err := index.StartScan(ctx, scopes, "approx", "size", "later")
+	if err != nil || second == first {
+		t.Fatalf("new source reused generation=%d err=%v", second, err)
+	}
+	err = index.Upsert(ctx, IndexedFacts{Path: "/docs/a.md", Generation: first, Sources: map[string]map[string]float64{"size": {"bytes": 1}}})
+	if !errors.Is(err, errStaleFactsGeneration) {
+		t.Fatalf("stale upsert err=%v", err)
+	}
+	if rows, err := index.PrefixScan(ctx, "/docs"); err != nil || len(rows) != 0 {
+		t.Fatalf("stale upsert published rows=%v err=%v", rows, err)
+	}
+}
+
+func TestFactsScanContentBoundaryChangeStartsNewGeneration(t *testing.T) {
+	_, index := testFactsIndex(t)
+	ctx := context.Background()
+	first := []KnowledgeScope{{Name: "docs", Root: "/docs", ContentBoundary: "policy-one"}}
+	generation, err := index.StartScan(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.CompleteScanPath(ctx, generation, "/docs", []string{"/docs/stale.go"}, false); err != nil {
+		t.Fatal(err)
+	}
+	second := []KnowledgeScope{{Name: "docs", Root: "/docs", ContentBoundary: "policy-two"}}
+	restarted, err := index.StartScan(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted == generation {
+		t.Fatalf("content policy change resumed generation %d", generation)
+	}
+	paths, err := index.NextScanPaths(ctx, restarted, 10)
+	if err != nil || len(paths) != 1 || paths[0] != "/docs" {
+		t.Fatalf("new generation queue = %v, err=%v", paths, err)
+	}
+}

@@ -1,0 +1,193 @@
+export type Session = {
+  identity: string;
+  lore_path: string;
+  access: boolean;
+  sources?: boolean;
+};
+export type SourceSnapshot = {
+  snapshot: string;
+  time: string;
+  parent?: string;
+  deleted: number;
+  meta?: Record<string, string>;
+  files: Record<string, { sha256: string; size: number; mode: number }>;
+};
+export type Source = {
+  store: string;
+  owner: string;
+  projections: string[];
+  latest: SourceSnapshot;
+};
+export type TreeEntry = {
+  path: string;
+  name: string;
+  directory: boolean;
+  icon?: string;
+  bytes: number;
+};
+export type TreeResponse = { path: string; entries: TreeEntry[] };
+export type FilesResponse = {
+  path: string;
+  entries: { path: string; name: string }[];
+  truncated: boolean;
+};
+export type ContextNode = {
+  path: string;
+  name: string;
+  directory: boolean;
+  bytes: number;
+  lines: number;
+  characters: number;
+  tokens: number;
+  children?: ContextNode[];
+  analytics?: AnalyticsStatus;
+};
+export type AnalyticsStatus = {
+  state: "ready" | "cold" | "updating" | "disabled" | "failed" | "unavailable";
+  computed_at?: string;
+  updating: boolean;
+  complete: boolean;
+  coverage?: string;
+  error?: string;
+  warning?: string;
+  retry_at?: string;
+  progress?: {
+    phase: "content" | "history";
+    processed: number;
+    unit: string;
+    since?: string;
+  };
+};
+export type Facts = Pick<
+  ContextNode,
+  "bytes" | "lines" | "characters" | "tokens"
+>;
+export type FileResponse = {
+  path: string;
+  name: string;
+  source?: string;
+  html?: string;
+  content_type: string;
+  facts: Facts;
+  binary: boolean;
+};
+export type HistoryEntry = {
+  time: string;
+  attribution: string;
+  action: string;
+  hash: string;
+};
+export type HistoryResponse = {
+  available: boolean;
+  entries: HistoryEntry[];
+  next_cursor?: string;
+};
+export type UsagePoint = {
+  date: string;
+  human: number;
+  agent: number;
+  unknown: number;
+  reads: number;
+  writes: number;
+};
+export type Usage = {
+  reads: number;
+  hits: number;
+  writes: number;
+  commands: number;
+  human_writes: number;
+  agent_writes: number;
+  unknown_writes: number;
+  estimated_tokens: number;
+  estimated_reads: number;
+  unestimated_reads: number;
+  activity: UsagePoint[];
+  computed_at: string;
+  note?: string;
+  analytics?: AnalyticsStatus;
+};
+export type Materialized = {
+  status: string;
+  table: { columns: string[]; rows: unknown[][]; total: number };
+  computed_at: string;
+  window: unknown;
+  note?: string;
+  analytics?: AnalyticsStatus;
+};
+export type Access = {
+  path: string;
+  docsets: {
+    name: string;
+    roots: string[];
+    roles: { role: string; grant: string; denied: boolean }[];
+    readonly: boolean;
+  }[];
+  folder_rules: { origin: string; scope: string; rules: object }[];
+  notes: string[];
+};
+export type RuleSpec = {
+  /** Null when the rule omits `match`. */
+  match: string[] | null;
+  exclude?: string[];
+  use: string;
+  with?: Record<string, unknown>;
+  enforce?: boolean;
+  default?: boolean;
+};
+export type SetupDocset = {
+  name: string;
+  roots: string[];
+  aliases: string[];
+  grants: string[];
+  writable: boolean;
+  readonly: boolean;
+  home: boolean;
+  inbox?: string;
+  agent_skills: boolean;
+  okf: boolean;
+  config_files: string[];
+  roles?: { role: string; grant: string; denied: boolean }[];
+  rules?: Record<string, RuleSpec>;
+  config_edit?: string[];
+};
+export type ConfigFile = {
+  path: string;
+  /** lore.json, openlore.yml, or a folder's .lore/config.yaml. */
+  kind: "auth" | "server" | "folder";
+  scope: string;
+  docset?: string;
+};
+export type Setup = {
+  identity: string;
+  roles: string[];
+  home?: string;
+  access: boolean;
+  config_edit: boolean;
+  server: {
+    ssh: string;
+    http_url: string;
+    mcp_url?: string;
+    lore_path: string;
+    readonly: boolean;
+    skills: boolean;
+    analytics: boolean;
+    history: boolean;
+  };
+  docsets: SetupDocset[];
+  config_files: ConfigFile[];
+  truncated: boolean;
+  rules?: Record<string, RuleSpec>;
+  notes: string[];
+};
+export type AnalyticsProcessingStatus = {
+  activity: {
+    state: "ready" | "updating" | "failed" | "disabled" | "unavailable";
+    complete: boolean;
+    processed_since?: string;
+    latest_event?: string;
+    events_processed: number;
+    error?: string;
+  };
+};
+export type AnalyticsTab =
+  "overview" | "knowledge" | "usage" | "gaps" | "commands" | "access";

@@ -1,9 +1,13 @@
 package openlore
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"testing/fstest"
 
+	"github.com/aakarim/go-openlore/assets"
+	"github.com/aakarim/go-openlore/pkg/shell"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -50,9 +54,12 @@ func TestMCPToolAnnotations(t *testing.T) {
 				tools[tool.Name] = tool
 			}
 
-			shellTool, ok := tools["shell"]
+			shellTool, ok := tools["lore_bash"]
 			if !ok {
 				t.Fatal("shell tool is not registered")
+			}
+			if !strings.Contains(shellTool.Description, "heredoc") {
+				t.Error("shell tool description should document heredocs")
 			}
 			shellAnnotations := shellTool.Annotations
 			if shellAnnotations == nil {
@@ -90,6 +97,169 @@ func TestMCPToolAnnotations(t *testing.T) {
 			}
 			if listAnnotations.OpenWorldHint == nil || *listAnnotations.OpenWorldHint {
 				t.Errorf("list_commands openWorldHint = %v, want false", listAnnotations.OpenWorldHint)
+			}
+		})
+	}
+}
+
+func TestMCPServerInfoVersionMatchesBuild(t *testing.T) {
+	server := NewMCPServer(NewFSAdapter(fstest.MapFS{}))
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(t.Context(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.0.0"}, nil)
+	clientSession, err := client.Connect(t.Context(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+
+	got := clientSession.InitializeResult().ServerInfo.Version
+	if want := assets.Version(); got != want {
+		t.Fatalf("MCP serverInfo.version = %q, want build version %q", got, want)
+	}
+}
+
+func TestMCPShellErrorClassification(t *testing.T) {
+	fs := NewFSAdapter(fstest.MapFS{
+		"docs/a.md": &fstest.MapFile{Data: []byte("hello\n")},
+	})
+	server := NewMCPServer(fs)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(t.Context(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.0.0"}, nil)
+	clientSession, err := client.Connect(t.Context(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+
+	result, err := clientSession.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "lore_bash",
+		Arguments: map[string]any{"command": "echo structured-output; cat /does/not/exist"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatal("completed shell invocation IsError = true, want false")
+	}
+	output := result.Content[0].(*mcp.TextContent).Text
+	if strings.HasPrefix(output, "\n") {
+		t.Fatalf("output starts with a blank line: %q", output)
+	}
+	if !strings.Contains(output, "structured-output") {
+		t.Fatalf("output %q does not contain stdout", output)
+	}
+	if strings.Contains(output, "exit code:") {
+		t.Fatalf("output %q contains a synthetic exit-code line", output)
+	}
+	exitCode, ok := exitCodeFromStructured(result.StructuredContent)
+	if !ok {
+		t.Fatalf("StructuredContent = %#v, want a map with an integer exit_code", result.StructuredContent)
+	}
+	if exitCode != 1 {
+		t.Fatalf("exit_code = %d, want 1", exitCode)
+	}
+	structured := result.StructuredContent.(map[string]any)
+	if structured["output"] != output {
+		t.Fatalf("structured output = %#v, want %q", structured["output"], output)
+	}
+	if structured["stdout"] != "structured-output\n" {
+		t.Fatalf("structured stdout = %#v, want %q", structured["stdout"], "structured-output\n")
+	}
+	stderr, ok := structured["stderr"].(string)
+	stderrLower := strings.ToLower(stderr)
+	if !ok || (!strings.Contains(stderrLower, "not exist") && !strings.Contains(stderrLower, "no such")) {
+		t.Fatalf("structured stderr = %#v, want missing-file diagnostic", structured["stderr"])
+	}
+
+	result, err = clientSession.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "lore_bash",
+		Arguments: map[string]any{"command": "grep -c absent /docs/a.md"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatal("no-match grep IsError = true, want false")
+	}
+	output = result.Content[0].(*mcp.TextContent).Text
+	if output != "0\n" {
+		t.Fatalf("no-match grep output = %q, want %q", output, "0\n")
+	}
+	exitCode, ok = exitCodeFromStructured(result.StructuredContent)
+	if !ok || exitCode != 1 {
+		t.Fatalf("no-match grep exit_code = %d, %t; want 1, true", exitCode, ok)
+	}
+}
+
+func TestExecShellTranscriptPreservesStreams(t *testing.T) {
+	sh := shell.NewShell(NewFSAdapter(fstest.MapFS{
+		"docs/a.md": &fstest.MapFile{Data: []byte("hello\n")},
+	}))
+
+	cases := []struct {
+		name       string
+		command    string
+		wantOutput string
+		wantStdout string
+		wantStderr string
+		wantExit   int
+	}{
+		{name: "stdout only", command: "cat /docs/a.md", wantOutput: "hello\n", wantStdout: "hello\n"},
+		{name: "nonzero with stdout", command: "grep -c absent /docs/a.md", wantOutput: "0\n", wantStdout: "0\n", wantExit: 1},
+		{name: "stderr only", command: "cat /does/not/exist", wantOutput: "cat: /does/not/exist: open does/not/exist: file does not exist\n", wantStderr: "cat: /does/not/exist: open does/not/exist: file does not exist\n", wantExit: 1},
+		{name: "exit code only", command: "false", wantExit: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			output, stdout, stderr, exitCode := execShellTranscript(t.Context(), sh, tc.command)
+			if exitCode != tc.wantExit {
+				t.Fatalf("exit code = %d, want %d", exitCode, tc.wantExit)
+			}
+			if output != tc.wantOutput {
+				t.Fatalf("output = %q, want %q", output, tc.wantOutput)
+			}
+			if stdout != tc.wantStdout {
+				t.Fatalf("stdout = %q, want %q", stdout, tc.wantStdout)
+			}
+			if stderr != tc.wantStderr {
+				t.Fatalf("stderr = %q, want %q", stderr, tc.wantStderr)
+			}
+		})
+	}
+}
+
+func TestExitCodeFromStructured(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     any
+		want   int
+		wantOK bool
+	}{
+		{name: "float64", in: map[string]any{"exit_code": float64(2)}, want: 2, wantOK: true},
+		{name: "int", in: map[string]any{"exit_code": 3}, want: 3, wantOK: true},
+		{name: "int64", in: map[string]any{"exit_code": int64(4)}, want: 4, wantOK: true},
+		{name: "json.Number", in: map[string]any{"exit_code": json.Number("5")}, want: 5, wantOK: true},
+		{name: "missing", in: map[string]any{}, want: 0, wantOK: false},
+		{name: "not a map", in: "nope", want: 0, wantOK: false},
+		{name: "wrong type", in: map[string]any{"exit_code": "1"}, want: 0, wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := exitCodeFromStructured(tc.in)
+			if ok != tc.wantOK || got != tc.want {
+				t.Fatalf("exitCodeFromStructured(%#v) = (%d, %v), want (%d, %v)", tc.in, got, ok, tc.want, tc.wantOK)
 			}
 		})
 	}

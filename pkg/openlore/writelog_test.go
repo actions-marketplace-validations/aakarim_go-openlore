@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aakarim/go-openlore/internal/analytics"
 	"github.com/aakarim/go-openlore/internal/config"
 	"github.com/aakarim/go-openlore/pkg/vfs"
 )
@@ -263,7 +264,7 @@ type wlGatedFS struct {
 
 type failingCommitRecorder struct{ err error }
 
-func (r failingCommitRecorder) RecordCommit(context.Context, CommitRecord) error { return r.err }
+func (r failingCommitRecorder) Record(context.Context, []HistoryRecord) error { return r.err }
 
 func (g *wlGatedFS) WriteFileAtomic(name string, data []byte, opts vfs.WriteOpts) (string, error) {
 	g.entered <- name
@@ -391,10 +392,83 @@ func TestWriteLog_PostCommitRunsWithActorAndDoesNotBlockSubmit(t *testing.T) {
 	}
 }
 
+func TestWriteLogSnapshotsAttributionBeforeAsyncPostCommit(t *testing.T) {
+	fs := &wlRecordingFS{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	seen := make(chan string, 1)
+	l := newWriteLog(fs, func(_ context.Context, info CommitInfo) error {
+		close(started)
+		<-release
+		seen <- info.Attribution.Extra["invocation_id"]
+		return nil
+	}, nil, 1)
+	defer l.Close(context.Background())
+
+	attribution := Attribution{Principal: "alice", Extra: map[string]string{"invocation_id": "original"}}
+	if _, err := l.Submit(context.Background(), attribution, writeCS("/a")); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	attribution.Extra["invocation_id"] = "next"
+	close(release)
+	if got := <-seen; got != "original" {
+		t.Fatalf("post-commit attribution = %q, want immutable snapshot", got)
+	}
+}
+
+func TestWriteLogCommitStateRunsBeforeSuccessAndSurfacesFailure(t *testing.T) {
+	fs := &wlRecordingFS{}
+	stateErr := errors.New("state disk full")
+	var stateSawContent bool
+	l := newWriteLog(fs, nil, nil, 1)
+	l.SetCommitState(func(_ context.Context, info CommitInfo) error {
+		content, err := fs.ReadFile(info.ChangeSet.Target)
+		stateSawContent = err == nil && string(content) == "x"
+		return stateErr
+	})
+	defer l.Close(context.Background())
+
+	if _, err := l.Submit(context.Background(), Attribution{}, writeCS("/committed")); !errors.Is(err, stateErr) {
+		t.Fatalf("state failure = %v", err)
+	}
+	if !stateSawContent {
+		t.Fatal("state hook ran before content commit")
+	}
+	if content, err := fs.ReadFile("/committed"); err != nil || string(content) != "x" {
+		t.Fatalf("content was not committed: content=%q err=%v", content, err)
+	}
+}
+
+func TestWriteLogPersistsInternalActorKindForReplay(t *testing.T) {
+	fs := &wlRecordingFS{}
+	commitPath := filepath.Join(t.TempDir(), "commits.jsonl")
+	l := newWriteLog(fs, nil, nil, 1)
+	l.SetCommitJournal(fileCommitJournal(commitPath), nil, false)
+	if _, err := l.Submit(context.Background(), Attribution{Principal: "agent_skills_remote", internal: true}, writeCS("/internal")); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor, err := OpenHistoryCursor(commitPath, HistoryPosition{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok, err := cursor.Next(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("persisted commit: ok=%v err=%v", ok, err)
+	}
+	if record.Attribution.ActorKind != "agent" || classifyAttribution(record.Attribution) != analytics.WriterAgent {
+		t.Fatalf("persisted attribution = %#v", record.Attribution)
+	}
+}
+
 func TestWriteLog_RecorderFailureDoesNotTurnCommittedWriteIntoFailure(t *testing.T) {
 	fs := &wlRecordingFS{}
 	l := newWriteLog(fs, nil, nil, 1)
-	l.SetCommitRecorder(failingCommitRecorder{err: errors.New("history disk full")})
+	l.SetHistoryRecorder(failingCommitRecorder{err: errors.New("history disk full")})
 	defer l.Close(context.Background())
 
 	hash, err := l.Submit(context.Background(), Attribution{Principal: "alice"}, writeCS("/committed"))
@@ -403,6 +477,31 @@ func TestWriteLog_RecorderFailureDoesNotTurnCommittedWriteIntoFailure(t *testing
 	}
 	if got := fs.order(); len(got) != 1 || got[0] != "/committed" {
 		t.Fatalf("applied=%v", got)
+	}
+}
+
+func TestWriteLog_CommittedDeleteAdvancesHistoryHead(t *testing.T) {
+	fs := &wlRecordingFS{}
+	store := NewJSONLHistoryStore(t.TempDir())
+	l := newWriteLog(fs, nil, nil, 1)
+	l.SetHistoryRecorder(store)
+	defer l.Close(context.Background())
+
+	if _, err := l.Submit(context.Background(), Attribution{Principal: "alice"}, writeCS("/docs/note.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(store.filePath("/docs/note.md")); err != nil {
+		t.Fatalf("write did not create history shard: %v", err)
+	}
+	if _, err := l.Submit(context.Background(), Attribution{Principal: "alice"}, vfs.ChangeSet{Target: "/docs/note.md", Action: vfs.ChangeActionRemove}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.Query(context.Background(), HistoryQuery{FileKey: "/docs/note.md", Roots: []string{"/docs"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Records) != 2 || page.Records[0].Action != string(vfs.ChangeActionRemove) || page.Records[0].CommitID == "" {
+		t.Fatalf("delete did not become the per-path history head: %#v", page.Records)
 	}
 }
 

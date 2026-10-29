@@ -30,6 +30,47 @@ func TestSedSubstitutionWithSpaces(t *testing.T) {
 	}
 }
 
+func TestSedRejectsUnsupportedOptionBeforeProcessing(t *testing.T) {
+	fs := testFS()
+	original, err := fs.ReadFile("/docs/readme.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, errOut, code := execCmd(t, fs, "sed -E -i 's/Hello/Goodbye/' /docs/readme.md")
+	if code == 0 || out != "" || !strings.Contains(errOut, `sed: unknown option "-E"`) {
+		t.Fatalf("code=%d stdout=%q stderr=%q, want named option error", code, out, errOut)
+	}
+	content, err := fs.ReadFile("/docs/readme.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != string(original) {
+		t.Fatalf("unsupported option modified file: got %q, want %q", content, original)
+	}
+}
+
+func TestSedOptionTerminator(t *testing.T) {
+	fs := testFS()
+	fs.AddFile("/-input", "foo\n")
+
+	t.Run("filename beginning with dash", func(t *testing.T) {
+		out, errOut, code := execCmd(t, fs, "sed -- 's/foo/bar/' -input")
+		if code != 0 || out != "bar\n" || errOut != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
+		}
+	})
+
+	t.Run("option-like expression", func(t *testing.T) {
+		// After --, "-n" is the expression (not the quiet option), so it is
+		// parsed as the unsupported command '-', as in GNU sed.
+		out, errOut, code := execCmd(t, fs, "echo foo | sed -- -n")
+		if code == 0 || out != "" || !strings.Contains(errOut, "sed: unsupported command '-' in expression '-n'") {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, out, errOut)
+		}
+	})
+}
+
 func TestSedSubstitutionGlobal(t *testing.T) {
 	fs := testFS()
 	out, _, code := execCmd(t, fs, "cat /docs/notes.txt | sed 's/apple/APPLE/g'")
@@ -41,6 +82,264 @@ func TestSedSubstitutionGlobal(t *testing.T) {
 	}
 	if !strings.Contains(out, "APPLE") {
 		t.Errorf("sed s///g: should contain 'APPLE', got:\n%s", out)
+	}
+}
+
+func TestSedSubstitutionUsesBasicRegexp(t *testing.T) {
+	fs := testFS()
+	original := "Pre-req: descriptions shipped (see Dependencies). [BLOCKED: web form]\n"
+	fs.AddFile("/docs/listing.md", original)
+
+	_, errOut, code := execCmd(t, fs, `sed -i 's|(see Dependencies). \[BLOCKED: web form\]|(see Dependencies). [DONE 2026-09-08 — submitted]|' /docs/listing.md`)
+	if code != 0 {
+		t.Fatalf("sed BRE substitution failed: code=%d stderr=%s", code, errOut)
+	}
+
+	content, err := fs.ReadFile("/docs/listing.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Pre-req: descriptions shipped (see Dependencies). [DONE 2026-09-08 — submitted]\n"
+	if string(content) != want {
+		t.Fatalf("content = %q, want %q", content, want)
+	}
+}
+
+func TestSedBasicRegexpAnchorsAndReplacementReferences(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{"literal caret", `echo 'a^b' | sed 's/a^b/X/'`, "X\n"},
+		{"literal dollar", `echo 'c$d' | sed 's/c$d/Y/'`, "Y\n"},
+		{"start anchor", `echo abc | sed 's/^a/A/'`, "Abc\n"},
+		{"end anchor", `echo abc | sed 's/c$/C/'`, "abC\n"},
+		{"replacement references", `echo foo | sed 's/\(foo\)/[\1]& $ \&/'`, "[foo]foo $ &\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, errOut, code := execCmd(t, testFS(), tt.command)
+			if code != 0 || out != tt.want {
+				t.Fatalf("code=%d stdout=%q stderr=%s, want %q", code, out, errOut, tt.want)
+			}
+		})
+	}
+}
+
+func TestSedSubstitutionReplacementEscapes(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{"newline escape", `echo a | sed 's/a/x\ny/'`, "x\ny\n"},
+		{"tab escape", `echo a | sed 's/a/x\ty/'`, "x\ty\n"},
+		{"backslash escape", `echo a | sed 's/a/x\\y/'`, "x\\y\n"},
+		{"escaped slash with alternate delimiter", `echo a/b | sed 's#a/b#c\/d#'`, "c/d\n"},
+		{"escaped delimiter", `echo a | sed 's#a#x\#y#'`, "x#y\n"},
+		{"backslash newline continuation", "echo a | sed 's/a/x\\\ny/'", "x\ny\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, errOut, code := execCmd(t, testFS(), tt.command)
+			if code != 0 || out != tt.want {
+				t.Fatalf("code=%d stdout=%q stderr=%s, want %q", code, out, errOut, tt.want)
+			}
+		})
+	}
+}
+
+func TestSedAddressUsesBasicRegexp(t *testing.T) {
+	tests := []struct {
+		name, options, expr, input, want string
+	}{
+		{"literal alternation", "", `/a|b/d`, "a\na|b\nkeep\n", "a\nkeep\n"},
+		{"literal parentheses", "", `/x(y)/d`, "xy\nx(y)\nkeep\n", "xy\nkeep\n"},
+		{"unbalanced literal parenthesis", "", `/y) z/d`, "x](y) z\nkeep\n", "keep\n"},
+		{"escaped alternation", "", `/a\|b/d`, "a\nb\nkeep\n", "keep\n"},
+		{"interval", "", `/^a\{1,2\}$/d`, "a\naa\naaa\n", "aaa\n"},
+		{"open interval", "", `/^a\{2,\}$/d`, "a\naa\naaa\n", "a\n"},
+		{"literal braces", "", `/a{1/d`, "a{1\nkeep\n", "keep\n"},
+		{"escaped backslash", "", `/a\\{1/d`, "a\\{1\nkeep\n", "keep\n"},
+		{"braces in class", "", `/^[\{]$/d`, "{\nkeep\n", "keep\n"},
+		{"literal closing bracket in class", "", `/^[]\{]$/d`, "]\n{\nkeep\n", "keep\n"},
+		{"negated class", "", `/^[^]\{]$/d`, "]\n{\na\n", "]\n{\n"},
+		{"POSIX class", "", `/^[[:alpha:]\{]$/d`, "a\n{\nkeep\n", "keep\n"},
+		{"print", "-n", `/x(y)/p`, "xy\nx(y)\n", "x(y)\n"},
+		{"append", "", `/x(y)/a added`, "xy\nx(y)\n", "xy\nx(y)\nadded\n"},
+		{"substitute", "", `/x(y)/s/x/X/`, "xy\nx(y)\n", "xy\nX(y)\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := testFS()
+			fs.AddFile("/docs/address.txt", tt.input)
+			out, errOut, code := execCmd(t, fs, "sed "+tt.options+" '"+tt.expr+"' /docs/address.txt")
+			if code != 0 || errOut != "" || out != tt.want {
+				t.Fatalf("code=%d stdout=%q stderr=%q, want %q", code, out, errOut, tt.want)
+			}
+			out, errOut, code = execCmd(t, fs, "sed -i "+tt.options+" '"+tt.expr+"' /docs/address.txt")
+			content, err := fs.ReadFile("/docs/address.txt")
+			if code != 0 || out != "" || errOut != "" || err != nil || string(content) != tt.want {
+				t.Fatalf("in-place: code=%d stdout=%q stderr=%q content=%q err=%v, want %q", code, out, errOut, content, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestSedRejectsInvalidAddressesBeforeWriting(t *testing.T) {
+	for _, tt := range []struct{ expr, wantErr string }{
+		{`/[/d`, "invalid regex in address"},
+		{`1,/[/d`, "invalid regex in address"},
+		{`/a\{1/d`, "invalid regex in address"},
+		{`1,/a\{1/d`, "invalid regex in address"},
+		{`/a\{x\}/d`, "invalid regex in address"},
+		{`1,/a\{x\}/d`, "invalid regex in address"},
+		{`/a\{1,2,3\}/d`, "invalid regex in address"},
+		{`/a\{\}/d`, "invalid regex in address"},
+		{`/a\{1}/d`, "invalid regex in address"},
+		{`/unterminated`, "unterminated address"},
+		{`\#a/b#d`, "unsupported command"},
+	} {
+		t.Run(tt.expr, func(t *testing.T) {
+			fs := testFS()
+			const original = "one\ntwo\n"
+			fs.AddFile("/docs/address.txt", original)
+			out, errOut, code := execCmd(t, fs, "sed -i -e '1d' -e '"+tt.expr+"' /docs/address.txt")
+			if code == 0 || out != "" || !strings.Contains(errOut, tt.wantErr) {
+				t.Fatalf("code=%d stdout=%q stderr=%q, want address error before processing", code, out, errOut)
+			}
+			content, err := fs.ReadFile("/docs/address.txt")
+			if err != nil || string(content) != original {
+				t.Fatalf("content=%q err=%v, want unchanged file", content, err)
+			}
+		})
+	}
+}
+
+func TestSedSubstitutionReplacementNewlineInPlace(t *testing.T) {
+	fs := testFS()
+	fs.AddFile("/docs/escape.md", "a\n")
+
+	_, errOut, code := execCmd(t, fs, `sed -i 's/a/x\ny/' /docs/escape.md`)
+	if code != 0 {
+		t.Fatalf("sed replacement failed: code=%d stderr=%s", code, errOut)
+	}
+	content, err := fs.ReadFile("/docs/escape.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "x\ny\n"; string(content) != want {
+		t.Fatalf("content = %q, want %q", content, want)
+	}
+}
+
+func TestSedSubstitutionPreservesSemicolonsInReplacement(t *testing.T) {
+	fs := testFS()
+	command := "sed -i '3s/.*/- **Status:** artifacts drafted; Glama submitted; remaining publishes blocked/' /docs/readme.md"
+	_, errOut, code := execCmd(t, fs, command)
+	if code != 0 {
+		t.Fatalf("sed substitution failed: code=%d stderr=%s", code, errOut)
+	}
+
+	content, err := fs.ReadFile("/docs/readme.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# Hello World\nThis is a test file.\n- **Status:** artifacts drafted; Glama submitted; remaining publishes blocked\nLine 4\nLine 5\n"
+	if string(content) != want {
+		t.Fatalf("content = %q, want %q", content, want)
+	}
+}
+
+func TestSedSubstitutionCommandSeparator(t *testing.T) {
+	out, errOut, code := execCmd(t, testFS(), "sed -n 's/apple/orange/g;p' /docs/notes.txt")
+	if code != 0 {
+		t.Fatalf("sed commands failed: code=%d stderr=%s", code, errOut)
+	}
+	if strings.Contains(out, "apple") || strings.Count(out, "orange") != 2 {
+		t.Fatalf("output = %q, want substitution followed by print", out)
+	}
+}
+
+func TestSedSubstitutionsApplySequentially(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{"separate expressions", "echo ab | sed -e 's/a/X/' -e 's/b/Y/'", "XY\n"},
+		{"command separator", "echo ab | sed 's/a/X/;s/b/Y/'", "XY\n"},
+		{"global then first match", "echo aa | sed 's/a/X/g;s/X/Z/'", "ZX\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, errOut, code := execCmd(t, testFS(), tt.command)
+			if code != 0 || out != tt.want {
+				t.Fatalf("code=%d stdout=%q stderr=%s, want %q", code, out, errOut, tt.want)
+			}
+		})
+	}
+}
+
+func TestSedPreservesSemicolonsInDelimitedValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{"address", "echo 'left;right' | sed -n '/left;right/p'", "left;right\n"},
+		{"pattern", "echo 'foo;bar' | sed 's/foo;bar/matched/'", "matched\n"},
+		{"escaped address delimiter", "echo 'path/with;semi' | sed -n '/path\\/with;semi/p'", "path/with;semi\n"},
+		{"replacement after address whitespace", "echo x | sed '1 s/x/a;b/'", "a;b\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, errOut, code := execCmd(t, testFS(), tt.command)
+			if code != 0 {
+				t.Fatalf("sed command failed: code=%d stderr=%s", code, errOut)
+			}
+			if out != tt.want {
+				t.Fatalf("output = %q, want %q", out, tt.want)
+			}
+		})
+	}
+}
+
+func TestSedAppendWhitespace(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{"one-line form ignores separator whitespace", "echo x | sed '1a \t hello'", "x\nhello\n"},
+		{"backslash form preserves whitespace", `echo x | sed '1a\  hello'`, "x\n  hello\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, errOut, code := execCmd(t, testFS(), tt.command)
+			if code != 0 || out != tt.want {
+				t.Fatalf("code=%d stdout=%q stderr=%s, want %q", code, out, errOut, tt.want)
+			}
+		})
+	}
+}
+
+func TestHelpDocumentsSedAppendForms(t *testing.T) {
+	out, errOut, code := execCmd(t, testFS(), "help")
+	if code != 0 {
+		t.Fatalf("help failed: code=%d stderr=%s", code, errOut)
+	}
+	for _, form := range []string{"sed '/pat/a text'", `sed '/pat/a\<text>'`} {
+		if !strings.Contains(out, form) {
+			t.Errorf("help does not document %q", form)
+		}
+	}
+	if !strings.Contains(out, `Replacement escapes: \n newline, \t tab, \\ backslash`) {
+		t.Error("help does not document sed replacement escapes")
+	}
+	if !strings.Contains(out, "Escape delimiters with a backslash; backslash-newline inserts a newline") {
+		t.Error("help does not document sed replacement delimiter and continuation escapes")
 	}
 }
 
@@ -62,5 +361,54 @@ func TestSedAppendMultilineInPlace(t *testing.T) {
 	want := "# Hello World\nThis is a test file.\n* idea, with context (important); keep it\n* another idea\nLine 3\nLine 4\nLine 5\n"
 	if string(content) != want {
 		t.Fatalf("content = %q, want %q", content, want)
+	}
+}
+
+func TestSedRejectsUnsupportedCommands(t *testing.T) {
+	tests := []struct {
+		name    string
+		expr    string
+		wantErr string
+	}{
+		{"change", `2c\CHANGED`, "unsupported command 'c'"},
+		{"insert", `1i\BEFORE`, "unsupported command 'i'"},
+		{"transliterate", `y/o/0/`, "unsupported command 'y'"},
+		{"quit", `1q`, "unsupported command 'q'"},
+		{"unknown letter", `zzz`, "unsupported command 'z'"},
+		{"after a supported command", `s/o/0/;q`, "unsupported command 'q'"},
+		{"missing command", `2`, "missing command"},
+		{"unknown s flag", `s/o/0/w`, "unknown option to 's': 'w'"},
+		{"numeric s flag", `s/o/0/2`, "unknown option to 's': '2'"},
+		{"flag after extra delimiter", `s/o/0/g/w`, "unknown option to 's': '/'"},
+		{"unterminated s", `s/o`, "unterminated 's' command"},
+		{"text after d", `dTYPO`, "extra characters after command 'd'"},
+		{"text after p", `1pq`, "extra characters after command 'p'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, errOut, code := execCmd(t, testFS(), "printf 'one\\ntwo\\n' | sed '"+tt.expr+"'")
+			if code == 0 || out != "" || !strings.Contains(errOut, tt.wantErr) {
+				t.Fatalf("code=%d stdout=%q stderr=%q, want non-zero exit, no output, and %q", code, out, errOut, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestSedInPlaceUnsupportedCommandLeavesFileUntouched(t *testing.T) {
+	fs := testFS()
+	original, err := fs.ReadFile("/docs/readme.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, errOut, code := execCmd(t, fs, `sed -i '2c\CHANGED' /docs/readme.md`)
+	if code == 0 || out != "" || !strings.Contains(errOut, "sed: unsupported command 'c'") {
+		t.Fatalf("code=%d stdout=%q stderr=%q, want named command error", code, out, errOut)
+	}
+	content, err := fs.ReadFile("/docs/readme.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != string(original) {
+		t.Fatalf("unsupported command modified file: got %q, want %q", content, original)
 	}
 }

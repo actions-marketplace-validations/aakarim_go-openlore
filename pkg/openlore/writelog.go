@@ -2,15 +2,14 @@ package openlore
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/aakarim/go-openlore/internal/analytics"
 	"github.com/aakarim/go-openlore/pkg/vfs"
 )
 
@@ -31,46 +30,9 @@ type applyResult struct {
 type logEntry struct {
 	cs          vfs.ChangeSet
 	attribution Attribution
+	identity    *Identity
+	task        func() error
 	reply       chan applyResult
-}
-
-// CommitRecord is the durable, queryable provenance record for one committed
-// ChangeSet. Fact-level provenance is derived from these records.
-type CommitRecord struct {
-	Time        time.Time     `json:"time"`
-	Attribution Attribution   `json:"attribution"`
-	ChangeSet   vfs.ChangeSet `json:"change_set"`
-	Hash        string        `json:"hash,omitempty"`
-}
-
-type CommitRecorder interface {
-	RecordCommit(context.Context, CommitRecord) error
-}
-
-type JSONLCommitRecorder struct {
-	mu   sync.Mutex
-	path string
-}
-
-func NewJSONLCommitRecorder(path string) *JSONLCommitRecorder {
-	return &JSONLCommitRecorder{path: path}
-}
-
-func (r *JSONLCommitRecorder) RecordCommit(_ context.Context, record CommitRecord) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := json.NewEncoder(f).Encode(record); err != nil {
-		return err
-	}
-	return f.Sync()
 }
 
 // writeLog is the ordered write log and its single serialized applier — the sole
@@ -91,12 +53,16 @@ type writeLog struct {
 	substrate vfs.WritableFS
 	logger    *slog.Logger
 
-	mu         sync.RWMutex      // guards closed + postCommit + serializes sends against Close
-	postCommit PostCommitHandler // optional; runs at the applier after a durable commit
-	preApply   func(Attribution, vfs.ChangeSet) error
-	recorder   CommitRecorder
-	closed     bool
-	ch         chan logEntry
+	mu           sync.RWMutex      // guards closed + postCommit + serializes sends against Close
+	postCommit   PostCommitHandler // optional; runs at the applier after a durable commit
+	commitState  func(context.Context, CommitInfo) error
+	preApply     func(*Identity, Attribution, vfs.ChangeSet) error
+	history      HistoryRecorder
+	journal      CommitJournal
+	blobs        BlobStore
+	blobsEnabled bool
+	closed       bool
+	ch           chan logEntry
 
 	done chan struct{} // closed when the applier goroutine has exited
 }
@@ -135,7 +101,14 @@ func newWriteLog(substrate vfs.WritableFS, postCommit PostCommitHandler, logger 
 func (l *writeLog) run() {
 	defer close(l.done)
 	for e := range l.ch {
+		if e.task != nil {
+			e.reply <- applyResult{err: e.task()}
+			continue
+		}
+		historyRetentionMu.RLock()
 		var committed vfs.CommitResult
+		commitID := analytics.NewID()
+		var leaves []LeafRecord
 		var err error
 		if preflight, ok := l.substrate.(vfs.ChangePreflighter); ok {
 			for _, change := range e.cs.Leaves() {
@@ -146,27 +119,49 @@ func (l *writeLog) run() {
 		}
 		l.mu.RLock()
 		pre := l.preApply
+		journal, blobs, blobsEnabled := l.journal, l.blobs, l.blobsEnabled
 		l.mu.RUnlock()
 		if err == nil && pre != nil {
-			err = pre(e.attribution, e.cs)
+			err = pre(e.identity, e.attribution, e.cs)
 		}
 		if err == nil {
+			var captureErr error
+			leaves, captureErr = capturePreImages(context.Background(), l.substrate, blobs, e.cs, blobsEnabled)
+			if captureErr != nil {
+				l.logger.Warn("history pre-image capture incomplete", "err", captureErr)
+			}
 			committed, err = vfs.CommitChangeSet(l.substrate, e.cs)
 		}
+		if committed.HasCommitted() {
+			leaves = fillAfter(leaves, committed.Committed)
+		}
+		attribution := durableAttribution(e.attribution)
 		if err == nil && committed.HasCommitted() {
 			l.mu.RLock()
-			recorder := l.recorder
+			state := l.commitState
 			l.mu.RUnlock()
-			if recorder != nil {
-				if recordErr := recorder.RecordCommit(context.Background(), CommitRecord{
-					Time: time.Now().UTC(), Attribution: e.attribution,
-					ChangeSet: committed.Committed, Hash: committed.Hash,
-				}); recordErr != nil {
+			if state != nil {
+				err = state(context.Background(), CommitInfo{ID: commitID, ChangeSet: committed.Committed, Hash: committed.Hash, Leaves: leaves, Attribution: attribution})
+			}
+		}
+		if committed.HasCommitted() {
+			if journal != nil {
+				recordedAt := time.Now().UTC()
+				if recordErr := journal.Append(context.Background(), CommitRecord{ID: commitID, Time: recordedAt, Attribution: attribution, ChangeSet: committed.Committed, Hash: committed.Hash, Leaves: leaves}); recordErr != nil {
+					l.logger.Error("commit journal recording failed after durable write", "err", recordErr)
+				}
+			}
+			l.mu.RLock()
+			history := l.history
+			l.mu.RUnlock()
+			if history != nil {
+				if recordErr := history.Record(context.Background(), indexedHistoryRecords(commitID, time.Now().UTC(), attribution, committed, leaves)); recordErr != nil {
 					l.logger.Error("commit provenance recording failed after durable write",
 						"target", e.cs.Target, "action", e.cs.Action, "hash", committed.Hash, "err", recordErr)
 				}
 			}
 		}
+		historyRetentionMu.RUnlock()
 		e.reply <- applyResult{hash: committed.Hash, err: err}
 		if !committed.HasCommitted() {
 			continue
@@ -177,22 +172,34 @@ func (l *writeLog) run() {
 		if pc == nil {
 			continue
 		}
-		if perr := pc(context.Background(), CommitInfo{ChangeSet: committed.Committed, Hash: committed.Hash, Attribution: e.attribution}); perr != nil {
+		if perr := pc(context.Background(), CommitInfo{ID: commitID, ChangeSet: committed.Committed, Hash: committed.Hash, Leaves: leaves, Attribution: attribution}); perr != nil {
 			l.logger.Error("post-commit chain failed; log continues",
 				"target", e.cs.Target, "action", e.cs.Action, "err", perr)
 		}
 	}
 }
 
-func (l *writeLog) SetPreApply(h func(Attribution, vfs.ChangeSet) error) {
+func (l *writeLog) SetPreApply(h func(*Identity, Attribution, vfs.ChangeSet) error) {
 	l.mu.Lock()
 	l.preApply = h
 	l.mu.Unlock()
 }
 
-func (l *writeLog) SetCommitRecorder(recorder CommitRecorder) {
+func (l *writeLog) SetCommitState(h func(context.Context, CommitInfo) error) {
 	l.mu.Lock()
-	l.recorder = recorder
+	l.commitState = h
+	l.mu.Unlock()
+}
+
+func (l *writeLog) SetHistoryRecorder(history HistoryRecorder) {
+	l.mu.Lock()
+	l.history = history
+	l.mu.Unlock()
+}
+
+func (l *writeLog) SetCommitJournal(journal CommitJournal, blobs BlobStore, enabled bool) {
+	l.mu.Lock()
+	l.journal, l.blobs, l.blobsEnabled = journal, blobs, enabled
 	l.mu.Unlock()
 }
 
@@ -211,6 +218,37 @@ func (l *writeLog) SetPostCommit(h PostCommitHandler) {
 // post-commit chain. It returns ErrLogClosed if the log is shutting down, or
 // ctx.Err() if ctx is cancelled first.
 func (l *writeLog) Submit(ctx context.Context, attribution Attribution, cs vfs.ChangeSet) (string, error) {
+	return l.submit(ctx, nil, attribution, cs)
+}
+
+func (l *writeLog) SubmitIdentity(ctx context.Context, identity Identity, cs vfs.ChangeSet) (string, error) {
+	return l.submit(ctx, &identity, identity.attribution(), cs)
+}
+
+// Do runs fn at the write applier, serialized with content commits.
+func (l *writeLog) Do(ctx context.Context, fn func() error) error {
+	reply := make(chan applyResult, 1)
+	l.mu.RLock()
+	if l.closed {
+		l.mu.RUnlock()
+		return ErrLogClosed
+	}
+	select {
+	case l.ch <- logEntry{task: fn, reply: reply}:
+		l.mu.RUnlock()
+	case <-ctx.Done():
+		l.mu.RUnlock()
+		return ctx.Err()
+	}
+	select {
+	case result := <-reply:
+		return result.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *writeLog) submit(ctx context.Context, identity *Identity, attribution Attribution, cs vfs.ChangeSet) (string, error) {
 	reply := make(chan applyResult, 1)
 
 	// Hold the read lock across the send so Close (which takes the write lock)
@@ -221,7 +259,7 @@ func (l *writeLog) Submit(ctx context.Context, attribution Attribution, cs vfs.C
 		return "", ErrLogClosed
 	}
 	select {
-	case l.ch <- logEntry{cs: cs, attribution: attribution, reply: reply}:
+	case l.ch <- logEntry{cs: cs, attribution: cloneAttribution(attribution), identity: identity, reply: reply}:
 		l.mu.RUnlock()
 	case <-ctx.Done():
 		l.mu.RUnlock()
@@ -236,13 +274,43 @@ func (l *writeLog) Submit(ctx context.Context, attribution Attribution, cs vfs.C
 	}
 }
 
-func (r CommitRecord) DisplayAttribution() string { return r.Attribution.String() }
+func historyRecords(at time.Time, attribution Attribution, committed vfs.CommitResult) []HistoryRecord {
+	return historyRecordsWithCommitID("", at, attribution, committed)
+}
 
-func (r CommitRecord) Validate() error {
-	if r.Attribution.Principal == "" {
-		return fmt.Errorf("commit attribution principal is required")
+func historyRecordsWithCommitID(commitID string, at time.Time, attribution Attribution, committed vfs.CommitResult) []HistoryRecord {
+	leaves := committed.Committed.Leaves()
+	records := make([]HistoryRecord, 0, len(leaves))
+	for _, leaf := range leaves {
+		hash := ""
+		if leaf.Write != nil {
+			if len(leaves) == 1 && committed.Hash != "" {
+				hash = committed.Hash
+			} else {
+				sum := sha256.Sum256(leaf.Write.Bytes)
+				hash = hex.EncodeToString(sum[:])
+			}
+		}
+		records = append(records, HistoryRecord{
+			CommitID: commitID, Time: at, Attribution: attribution, FileKey: vfs.CleanPath(leaf.Target),
+			Action: string(leaf.Action), ContentHash: hash,
+		})
 	}
-	return nil
+	return records
+}
+
+func indexedHistoryRecords(commitID string, at time.Time, attribution Attribution, committed vfs.CommitResult, leaves []LeafRecord) []HistoryRecord {
+	if len(leaves) == 0 {
+		return historyRecordsWithCommitID(commitID, at, attribution, committed)
+	}
+	records := make([]HistoryRecord, 0, len(leaves))
+	for _, leaf := range leaves {
+		records = append(records, HistoryRecord{
+			CommitID: commitID, Time: at, Attribution: attribution, FileKey: vfs.CleanPath(leaf.Target),
+			Action: string(leaf.Action), ContentHash: leaf.AfterHash,
+		})
+	}
+	return records
 }
 
 // Close stops accepting new submits, lets the applier drain all queued entries

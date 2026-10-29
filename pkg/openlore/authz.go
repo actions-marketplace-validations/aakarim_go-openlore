@@ -2,8 +2,11 @@ package openlore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
+	"path"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -218,6 +221,17 @@ func (s *Server) effectiveGrantNames(id Identity, name string) ([]string, bool) 
 	if policy.IdentityName != "guest" && policy.HomeDocset == name {
 		names["rw"] = true
 	}
+	// A projection mounted strictly beneath the caller's home is readable by
+	// them without an access block: it is their own source under their own
+	// root. Writes stay denied because projections have no writable substrate.
+	if ds.Projection != nil && policy.IdentityName != "guest" && policy.HomeDocset != "" {
+		if home, ok := s.currentAuth().Docsets[policy.HomeDocset]; ok {
+			homeRoot, root := primaryDisplayPath(home), primaryDisplayPath(ds)
+			if homeRoot != "" && root != "" && root != homeRoot && pathWithinRoot(homeRoot, root) {
+				names["ro"] = true
+			}
+		}
+	}
 	out := make([]string, 0, len(names))
 	for grant := range names {
 		out = append(out, grant)
@@ -236,23 +250,31 @@ func (s *Server) hasCurrentCapability(id Identity, capability string) bool {
 }
 
 func (s *Server) hasCapabilityForPolicy(policy AuthorizationPolicy, capability string) bool {
+	return s.capabilityDenial(policy, capability) == ""
+}
+
+// capabilityDenial names the condition that withholds capability from policy,
+// or returns "" when the capability is granted.
+func (s *Server) capabilityDenial(policy AuthorizationPolicy, capability string) string {
 	for _, denied := range policy.DenyCapabilities {
 		if denied == capability {
-			return false
+			return fmt.Sprintf("the delegate entry for this actor denies capability %s (deny_capabilities)", capability)
 		}
 	}
 	allowed := false
+	var roles []string
 	for _, roleName := range policy.Roles {
 		role, ok := s.currentAuth().Roles[roleName]
 		if !ok {
 			if roleName == "guest" {
 				continue
 			}
-			return false
+			return fmt.Sprintf("role %s is not defined", roleName)
 		}
+		roles = append(roles, roleName)
 		for _, denied := range role.Deny.Capabilities {
 			if denied == capability {
-				return false
+				return fmt.Sprintf("role %s denies capability %s (roles.%s.deny.capabilities)", roleName, capability, roleName)
 			}
 		}
 		for _, value := range role.Allow.Capabilities {
@@ -261,7 +283,64 @@ func (s *Server) hasCapabilityForPolicy(policy AuthorizationPolicy, capability s
 			}
 		}
 	}
-	return allowed
+	if allowed {
+		return ""
+	}
+	if len(roles) == 0 {
+		return fmt.Sprintf("identity %s has no role granting capability %s; grant it in roles.<role>.allow.capabilities", policy.IdentityName, capability)
+	}
+	return fmt.Sprintf("role(s) %s lack capability %s; grant it in roles.<role>.allow.capabilities", strings.Join(roles, ", "), capability)
+}
+
+// analyticsAdminDenial explains why id may not run instance-wide shell
+// analytics, or returns nil when it may. Current policy is read on every call.
+func (s *Server) analyticsAdminDenial(id Identity) error {
+	var reasons []string
+	id.policySnapshot = nil
+	if policy, err := s.currentPolicy(id); err != nil {
+		reasons = append(reasons, "cannot resolve current authorization: "+err.Error())
+	} else if reason := s.capabilityDenial(policy, "lore:analytics:admin"); reason != "" {
+		reasons = append(reasons, reason)
+	}
+	if !scopeGrantsWrite(id.Scopes) {
+		scope := strings.Join(id.Scopes, " ")
+		if scope == "" {
+			scope = "empty"
+		}
+		reasons = append(reasons, fmt.Sprintf("token scope is %s (full scope required); reconnect with full scope", scope))
+	}
+	if len(reasons) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s. Docset-scoped readers: use the web dashboard or analytics API instead", strings.Join(reasons, "; "))
+}
+
+// analyticsCapabilityWarnings reports policies that leave the shell analytics
+// command without an operator, including grants of the retired
+// lore:analytics:view capability.
+func analyticsCapabilityWarnings(auth *config.AuthConfig) []string {
+	names := make([]string, 0, len(auth.Roles))
+	for name := range auth.Roles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var warnings []string
+	admin := false
+	for _, name := range names {
+		for _, capability := range auth.Roles[name].Allow.Capabilities {
+			switch capability {
+			case "lore:analytics:view":
+				warnings = append(warnings, fmt.Sprintf("role %q grants lore:analytics:view, which no longer grants anything; the shell analytics command requires lore:analytics:admin", name))
+			case "lore:analytics:admin":
+				// A role that also denies the capability grants it to nobody.
+				admin = admin || !slices.Contains(auth.Roles[name].Deny.Capabilities, capability)
+			}
+		}
+	}
+	if !admin {
+		warnings = append(warnings, "no role grants lore:analytics:admin, so no identity can run the shell analytics command; add it to roles.<role>.allow.capabilities")
+	}
+	return warnings
 }
 
 // displayPath returns a path mapping's cleaned display (virtual) path, falling
@@ -403,42 +482,95 @@ func (s *Server) allDocsetRoots() []string {
 // write, the identity holds a grant on the docset containing p, that docset is
 // not per-docset readonly, and the grant permits the action on that path.
 func (s *Server) identityCanWrite(id Identity, action vfs.ChangeAction, p string) bool {
+	return s.identityWriteError(id, action, p) == nil
+}
+
+func (s *Server) identityWriteError(id Identity, action vfs.ChangeAction, p string) error {
 	id.policySnapshot = nil
 	if s.config.Readonly {
-		return false // global write lock closed
+		return fmt.Errorf("%w: server is read-only (readonly: true)", vfs.ErrReadOnly)
 	}
 	if !scopeGrantsWrite(id.Scopes) {
-		return false // token scope ceiling: only full authority may write
+		return fmt.Errorf("%w: token scope does not allow writes; use a full-scope token", vfs.ErrReadOnly)
 	}
 	p = s.canonicalPath(p)
+	if isDirConfigPath(p) && !s.identityHasDirConfigRole(id, p) {
+		return fmt.Errorf("%w: %s requires a role listed in the docset's config.edit policy", fs.ErrPermission, p)
+	}
 	if action == vfs.ChangeActionRemoveAll {
+		if !s.canEditDirConfigsInTree(id, p) {
+			return fmt.Errorf("%w: cannot delete %s without config.edit authority for its folder configs", fs.ErrPermission, p)
+		}
 		for _, candidate := range s.currentAuth().Docsets {
 			for _, pm := range candidate.Paths {
 				root := displayPath(pm)
 				if p != root && pathWithinRoot(p, root) {
-					return false // recursive delete would cross a nested docset boundary
+					return fmt.Errorf("%w: cannot delete %s across a nested docset boundary", vfs.ErrReadOnly, p)
 				}
 			}
 		}
 	}
 	ds, grants, ok := s.grantsForPath(id, p)
 	if !ok {
-		return false
+		return mutationDeniedError(s.merge, action, p)
+	}
+	if ds.Projection != nil {
+		return fmt.Errorf("source %s is a read-only source copy: %w", ds.Projection.Store, vfs.ErrReadOnly)
 	}
 	if ds.Readonly != nil && *ds.Readonly {
-		return false // per-docset lock can only further restrict
+		return fmt.Errorf("%w: docset containing %s is read-only (readonly: true)", vfs.ErrReadOnly, p)
 	}
 	if action == vfs.ChangeActionSetXattr || action == vfs.ChangeActionRemoveXattr || action == vfs.ChangeActionPreserveAndRecreateXattrs {
 		for _, grant := range grants {
 			if grant.Name() == "rw" {
-				return true
+				return nil
 			}
 		}
-		return false
+		return fmt.Errorf("%w: %s on %s requires an rw grant (run 'lore docsets')", vfs.ErrReadOnly, action, p)
 	}
 	for _, grant := range grants {
 		if grant.CanWrite(ds, action, p) {
-			return true
+			return nil
+		}
+	}
+	names := make([]string, 0, len(grants))
+	for _, grant := range grants {
+		names = append(names, grant.Name())
+	}
+	return fmt.Errorf("%w: grants (%s) do not permit %s on %s (run 'lore docsets')", vfs.ErrReadOnly, strings.Join(names, ", "), action, p)
+}
+
+func (s *Server) canEditDirConfigsInTree(id Identity, target string) bool {
+	allowed := true
+	err := vfs.WalkDir(s.merge, target, func(candidate string, _ *vfs.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if isDirConfigPath(candidate) && !s.identityHasDirConfigRole(id, candidate) {
+			allowed = false
+		}
+		return nil
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return err == nil && allowed
+}
+
+func (s *Server) identityHasDirConfigRole(id Identity, target string) bool {
+	_, docset, ok := s.mostSpecificDocset(path.Dir(path.Dir(target)))
+	if !ok || docset.Config == nil {
+		return false
+	}
+	policy, err := s.currentPolicy(id)
+	if err != nil {
+		return false
+	}
+	for _, allowed := range docset.Config.Edit {
+		for _, role := range policy.Roles {
+			if role == allowed {
+				return true
+			}
 		}
 	}
 	return false
@@ -597,16 +729,18 @@ func (s *scopedReadFS) within(p string) bool {
 	if bestRoot == "" {
 		return false // no readable root covers p
 	}
-	// A namespace directory leading to a nested docset is navigation-only. An
-	// ancestor grant (especially a docset at "/") must not make containers such
-	// as /agent, /user, or /channel visible unless they lead to a nested docset
-	// this identity can actually read; ancestor() handles that case below.
-	for _, boundary := range s.boundaries {
-		if boundary == clean {
-			continue
-		}
-		if clean == "/" || strings.HasPrefix(boundary, clean+"/") {
-			return false
+	// A root grant must not expose namespace containers such as /agent or
+	// /user unless they lead to a granted docset. An explicitly granted non-root
+	// docset, however, must stay navigable even when it contains a private child;
+	// the most-specific-boundary check below still hides that child's subtree.
+	if bestRoot == "/" {
+		for _, boundary := range s.boundaries {
+			if boundary == clean {
+				continue
+			}
+			if clean == "/" || strings.HasPrefix(boundary, clean+"/") {
+				return false
+			}
 		}
 	}
 	bestBoundary := ""
@@ -656,6 +790,13 @@ func (s *scopedReadFS) ReadFile(p string) ([]byte, error) {
 		return nil, fs.ErrNotExist
 	}
 	return s.FileSystem.ReadFile(p)
+}
+
+func (s *scopedReadFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	if !s.within(p) {
+		return nil, fs.ErrNotExist
+	}
+	return readFileBounded(s.FileSystem, p, maxBytes)
 }
 
 func (s *scopedReadFS) ReadDir(p string) ([]vfs.FileInfo, error) {

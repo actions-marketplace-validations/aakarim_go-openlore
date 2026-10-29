@@ -12,6 +12,7 @@ import (
 type Attribution struct {
 	Principal  string            `json:"principal"`
 	Actor      string            `json:"actor,omitempty"`
+	ActorKind  string            `json:"actor_kind,omitempty"`
 	ClientAuth ClientAuthLevel   `json:"client_auth,omitempty"`
 	Extra      map[string]string `json:"-"`
 	// internal is an unforgeable package capability. Public callers can set ID
@@ -45,12 +46,46 @@ func (a Attribution) String() string {
 type WriteOp struct {
 	changeSet   vfs.ChangeSet
 	Attribution Attribution
+	identity    *Identity
 }
 
 // NewWriteOp constructs an immutable admission operation. The changeset is
 // intentionally not exposed: policy middleware must inspect every leaf.
 func NewWriteOp(attribution Attribution, cs vfs.ChangeSet) WriteOp {
-	return WriteOp{changeSet: cloneWriteChangeSet(cs), Attribution: attribution}
+	return WriteOp{changeSet: cloneWriteChangeSet(cs), Attribution: cloneAttribution(attribution)}
+}
+
+func cloneAttribution(attribution Attribution) Attribution {
+	if attribution.Extra != nil {
+		extra := make(map[string]string, len(attribution.Extra))
+		for key, value := range attribution.Extra {
+			extra[key] = value
+		}
+		attribution.Extra = extra
+	}
+	return attribution
+}
+
+// durableAttribution preserves classification evidence that cannot otherwise
+// survive JSON persistence. Principal and Actor already provide durable human
+// and delegated-agent evidence; internal and explicit classifications do not.
+func durableAttribution(attribution Attribution) Attribution {
+	attribution = cloneAttribution(attribution)
+	if attribution.ActorKind != "" {
+		return attribution
+	}
+	if kind, ok := attribution.Extra["actor_kind"]; ok {
+		attribution.ActorKind = kind
+	} else if attribution.internal {
+		attribution.ActorKind = "agent"
+	}
+	return attribution
+}
+
+func newIdentityWriteOp(identity Identity, cs vfs.ChangeSet) WriteOp {
+	op := NewWriteOp(identity.attribution(), cs)
+	op.identity = &identity
+	return op
 }
 
 // Leaves returns every proposed mutation in execution order.
@@ -105,6 +140,7 @@ func cloneWriteChangeSet(cs vfs.ChangeSet) vfs.ChangeSet {
 		return out
 	}
 	out := cs
+	out.Moves = append([]vfs.Move(nil), cs.Moves...)
 	leaf := cloneLeaf(vfs.Change{Target: cs.Target, Action: cs.Action, Write: cs.Write, RemoveAll: cs.RemoveAll, Xattr: cs.Xattr, XattrRepair: cs.XattrRepair, XattrMigration: cs.XattrMigration})
 	out.Write, out.RemoveAll, out.Xattr, out.XattrRepair, out.XattrMigration = leaf.Write, leaf.RemoveAll, leaf.Xattr, leaf.XattrRepair, leaf.XattrMigration
 	if cs.Changes != nil {
@@ -155,8 +191,10 @@ func chainWrite(terminal WriteHandler, mws ...WriteMiddleware) WriteHandler {
 
 // CommitInfo describes a committed change.
 type CommitInfo struct {
+	ID          string
 	ChangeSet   vfs.ChangeSet
 	Hash        string
+	Leaves      []LeafRecord
 	Attribution Attribution
 }
 

@@ -10,13 +10,16 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aakarim/go-openlore/assets"
 	"github.com/aakarim/go-openlore/internal/config"
+	"github.com/aakarim/go-openlore/internal/telemetry"
 	openlore "github.com/aakarim/go-openlore/pkg/openlore"
 	"github.com/aakarim/go-openlore/pkg/shell/cmds"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -391,30 +394,25 @@ func main() {
 			}
 			mcpCmd.Parse(os.Args[2:])
 
-			// Build filesystem
-			var files config.FilesConfig
-			if *mcpAllowed != "" {
-				files.Allowed = splitAndTrim(*mcpAllowed)
-			}
-			if *mcpIgnore != "" {
-				files.Ignore = splitAndTrim(*mcpIgnore)
-			}
-
-			// Try loading config file for file filters
+			// Load config for file filters and tracing. A loaded file replaces the
+			// embedded config; the embedded config is used only when no file exists.
 			embeddedCfg, _ := assets.EmbeddedConfig()
 			cfgOpts := []config.Option{
 				config.WithConfigFile(*mcpConfig),
 				config.WithEmbeddedConfig(embeddedCfg, ""),
 			}
-			var resolvedCfg config.Config
-			if cfg, err := config.New(cfgOpts...); err == nil {
-				resolvedCfg = cfg
-				if len(files.Allowed) == 0 {
-					files.Allowed = cfg.Files.Allowed
-				}
-				if len(files.Ignore) == 0 {
-					files.Ignore = cfg.Files.Ignore
-				}
+			resolvedCfg, err := config.New(cfgOpts...)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			files := resolvedCfg.Files
+			fmt.Fprintf(os.Stderr, "config: %s\n", resolvedCfg.Source())
+			if *mcpAllowed != "" {
+				files.Allowed = splitAndTrim(*mcpAllowed)
+			}
+			if *mcpIgnore != "" {
+				files.Ignore = splitAndTrim(*mcpIgnore)
 			}
 
 			var vfs openlore.FileSystem
@@ -427,7 +425,7 @@ func main() {
 				}
 				vfs = openlore.NewDirFS(absDir, files)
 			} else if loreFS := assets.Lore(); loreFS != nil {
-				lower := openlore.NewFSAdapter(loreFS)
+				lower := openlore.NewFSAdapter(loreFS, files)
 				if resolvedCfg.WritableDir != "" {
 					upper := openlore.NewDirFS(resolvedCfg.WritableDir, files)
 					vfs = openlore.NewOverlayFS(upper, lower)
@@ -440,12 +438,15 @@ func main() {
 				os.Exit(1)
 			}
 
+			shutdownTelemetry := startTelemetry(resolvedCfg.Tracing)
 			server := openlore.NewMCPServer(vfs)
 			if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+				shutdownTelemetry()
 				fmt.Fprintf(os.Stderr, "mcp server error: %v\n", err)
 				os.Exit(1)
 			}
-			os.Exit(0)
+			shutdownTelemetry()
+			return
 
 		case "mcpb":
 			mcpbCmd := flag.NewFlagSet("mcpb", flag.ExitOnError)
@@ -643,7 +644,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Serve your docs to AI agents over SSH.\n\n")
 		fmt.Fprintf(os.Stderr, "Arguments:\n")
 		fmt.Fprintf(os.Stderr, "  directory    Directory to serve (default: current directory)\n\n")
-		fmt.Fprintf(os.Stderr, "Flags:\n")
+		fmt.Fprintf(os.Stderr, "Flags (override openlore.yml, which overrides the defaults shown):\n")
 		flag.PrintDefaults()
 	}
 
@@ -666,18 +667,18 @@ func main() {
 		rootDir = absDir
 	}
 
-	// Build config options.
-	// 1. Config file (from disk)
-	// 2. Embedded config (from assets/config/openlore.yml, if present)
-	// 3. CLI flag overrides (always win)
-	// Using both a config file and embedded config is an error.
+	// Build config options in precedence order.
+	// 1. Config file (from disk), replacing embedded config when loaded
+	// 2. Embedded config (from assets/config/openlore.yml, only without a file)
+	// 3. Built-in defaults
+	// CLI flag overrides are applied last and always win.
 	embeddedCfg, _ := assets.EmbeddedConfig()
 	opts := []openlore.Option{
 		openlore.WithConfigFile(*configFile),
 		openlore.WithEmbeddedConfig(embeddedCfg, assets.DefaultMOTD()),
 	}
 
-	if *port != 0 {
+	if isFlagSet("port") || isFlagSet("p") {
 		opts = append(opts, openlore.WithPort(*port))
 	}
 	if isFlagSet("metrics-port") {
@@ -738,7 +739,7 @@ func main() {
 	if resolved.Debug {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(telemetry.LogHandler{Handler: slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})})
 	slog.SetDefault(logger)
 	opts = append(opts, openlore.WithLogger(logger))
 
@@ -781,15 +782,19 @@ func main() {
 	} else if assets.Lore() != nil {
 		fmt.Printf("  Directory:  (embedded docs)\n")
 	}
-	fmt.Printf("  SSH:        ssh -p %d localhost\n", cfg.Port)
+	fmt.Printf("  config: %s\n", cfg.Source())
+	fmt.Printf("  SSH:        ssh %s\n", cfg.LocalSSHTarget())
 	if cfg.MetricsPort > 0 {
 		fmt.Printf("  Metrics:    http://localhost:%d/metrics\n", cfg.MetricsPort)
 	}
-	if cfg.HTTPPort > 0 {
-		fmt.Printf("  HTTP:       http://localhost:%d\n", cfg.HTTPPort)
+	writeHTTPBanner(os.Stdout, cfg, srv.DashboardReadiness())
+	// Generated instructions and links use the advertised address; show it
+	// whenever it differs from the local listeners above.
+	if cfg.SSHTarget() != cfg.LocalSSHTarget() {
+		fmt.Printf("  Public SSH: ssh %s\n", cfg.SSHTarget())
 	}
-	if cfg.MCPEnabled && cfg.MCPPath != "" && cfg.HTTPPort > 0 {
-		fmt.Printf("  MCP:        http://localhost:%d%s\n", cfg.HTTPPort, "/"+strings.Trim(cfg.MCPPath, "/"))
+	if cfg.HTTPPort > 0 && cfg.HTTPBaseURL() != cfg.LocalHTTPURL() {
+		fmt.Printf("  Public URL: %s\n", cfg.HTTPBaseURL())
 	}
 	fmt.Println()
 
@@ -799,9 +804,71 @@ func main() {
 		"allow_keyless", cfg.AllowKeyless,
 	)
 
-	if err := srv.ListenAndServe(); err != nil {
-		slog.Error("server exited with error", "error", err)
-		os.Exit(1)
+	shutdownTelemetry := startTelemetry(cfg.Tracing)
+	defer shutdownTelemetry()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			slog.Error("server exited with error", "error", err)
+			shutdownTelemetry()
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("shutdown incomplete", "error", err)
+		}
+	}
+}
+
+// Telemetry is best effort: exporter configuration or network failures must
+// not prevent serving knowledge. Never log exporter errors containing URLs
+// or authentication headers supplied through configuration.
+func startTelemetry(cfg config.TracingConfig) func() {
+	shutdown, err := telemetry.Setup(context.Background(), cfg, assets.Version())
+	if err != nil {
+		slog.Warn("tracing initialization failed; continuing without export")
+	}
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdown(ctx); err != nil {
+			slog.Warn("tracing shutdown incomplete")
+		}
+	}
+}
+
+// writeHTTPBanner prints the startup banner lines for endpoints served over
+// the HTTP port. SSH and MCP work out of the box; the dashboard also needs a
+// frontend in the build and sign-in configured, so its line says whether it
+// is ready and, if not, what to do, rather than leaving that to a bare error
+// in the browser.
+func writeHTTPBanner(w io.Writer, cfg config.Config, dashboard openlore.DashboardReadiness) {
+	if cfg.HTTPPort <= 0 {
+		return
+	}
+	base := cfg.LocalHTTPURL()
+	fmt.Fprintf(w, "  HTTP:       %s\n", base)
+	if dashboard.Ready {
+		fmt.Fprintf(w, "  Dashboard:  %s\n", dashboard.URL)
+	} else {
+		fmt.Fprintf(w, "  Dashboard:  %s\n", dashboard.Reason)
+		if len(dashboard.NextSteps) == 1 {
+			fmt.Fprintf(w, "              next step: %s\n", dashboard.NextSteps[0])
+		} else {
+			fmt.Fprintln(w, "              next steps:")
+			for i, step := range dashboard.NextSteps {
+				fmt.Fprintf(w, "              %d. %s\n", i+1, step)
+			}
+		}
+	}
+	if cfg.MCPEnabled && cfg.MCPPath != "" {
+		fmt.Fprintf(w, "  MCP:        %s/%s\n", base, strings.Trim(cfg.MCPPath, "/"))
 	}
 }
 
@@ -993,7 +1060,7 @@ func buildMCPB(output, name, description, docsDir string) {
 			"mcp_config":  mcpConfig,
 		},
 		"tools": []map[string]string{
-			{"name": "shell", "description": "Execute bash commands against the documentation filesystem"},
+			{"name": "lore_bash", "description": "Run a command in OpenLore's restricted shell over the documentation filesystem"},
 			{"name": "list_commands", "description": "List all available shell commands"},
 		},
 		"compatibility": map[string]any{

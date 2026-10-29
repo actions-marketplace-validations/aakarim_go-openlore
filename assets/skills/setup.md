@@ -29,23 +29,35 @@ Produce one Git repository named from the user's team with this shape:
 <team-slug>-lore/
 ├── Containerfile
 ├── openlore.yml
+├── lore.json
+├── home/                    # per-identity lore CLI settings
+│   └── <identity>/sources.yaml
 ├── .gitignore
 ├── deploy/
 │   └── README.md
+├── content/                 # gitignored; local throwaway server content
+│   ├── user/onboarding/README.md
+│   ├── channel/general/INDEX.md
+│   └── channel/infrastructure/
+│       ├── index.md
+│       ├── openlore-server.md
+│       └── log.md
 └── .local/
     ├── compose.yml
-    ├── lore.json
+    ├── lore.json            # disposable runtime copy of the blueprint
     ├── known_hosts
     ├── ssh_config
-    ├── filesystem/
-    │   ├── user/onboarding/README.md
-    │   └── channel/general/INDEX.md
+    ├── sources/             # lore CLI clones and source copies
+    ├── sync.json            # lore CLI per-identity sync state
     └── runtime.env
 ```
 
 `openlore.yml` is the project marker and the Git/IaC authority for server
 configuration. `.local/` is gitignored bootstrap state. It is never part of the
-image and is never committed.
+image and is never committed. `home/<identity>/sources.yaml` commits each person's source definitions only;
+`lore.json` commits identities, roles, docsets and projections, never tokens or
+private keys. `content/` is reserved for a future `lore pull`; for this throwaway
+local server only, seed its example files there. V1 `lore sync` never writes it.
 
 ## 1. Interview and inspect
 
@@ -102,6 +114,7 @@ port: 2222
 http_port: 8080
 metrics_port: 0
 default_cwd: /
+external_url: http://localhost:<selected HTTP port>
 
 host_key_path: /var/lib/openlore/ssh/openlore_ed25519
 auth_file: /var/lib/openlore/config/lore.json
@@ -109,9 +122,16 @@ data_dir: /var/lib/openlore/data
 writable_dir: /var/lib/openlore/published
 readonly: false
 
+tokens:
+  issuer: http://localhost:<selected HTTP port>
+  audience: http://localhost:<selected HTTP port>
+  access_ttl: 1h
+  refresh_ttl: 720h
+
 mcp:
   enabled: true
   path: /mcp
+  require_auth: true
 
 api:
   enabled: true
@@ -130,7 +150,11 @@ passkeys:
 These standard Unix paths are identical locally and remotely. Dynamic policy
 does not belong in this file.
 
-Create `.gitignore` with `/.local/`. Create `deploy/README.md` explaining that
+Do not create `home/` by hand; `lore source add` and `lore agent import` write
+`home/<identity>/sources.yaml` for the logged-in identity. Source sync is on by
+default and is a manual push (`lore sync`) only.
+Create `.gitignore` with both `/.local/` and `/content/`.
+Create `deploy/README.md` explaining that
 provider deployment skills place committed scripts and non-secret resource
 metadata below `deploy/<provider>/`; credentials and runtime state never go
 there.
@@ -149,11 +173,13 @@ what you are about to grant:
   "<agent name>"`; like the rest of `.local/`, the keypair is gitignored
   bootstrap state.
 - A **docset** is a permission-controlled knowledge folder. The person gets a
-  private home (`/user/onboarding`, writable only by them) and the team gets a
-  shared `general` docset (`/channel/general`).
+  private home (`/user/onboarding`, writable only by them) and the team gets
+  two shared docsets: `general` (`/channel/general`) for team context and
+  `infrastructure` (`/channel/infrastructure`) for the record of how this
+  server was set up, by whom, and where it runs — the setup record.
 - A **role** is a named permission bundle granted to identities; docsets allow
   roles `ro` or `rw`. People carry the `user` role and agents the `agent`
-  role; both get `rw` on `general`.
+  role; both get `rw` on `general` and `infrastructure`.
 - A **delegate** is an identity permitted to act on the person's behalf with
   the person's permissions; writes are attributed to `onboarding/<agent
   name>`. The agent identity becomes a delegate of the person.
@@ -162,8 +188,11 @@ what you are about to grant:
   before granting it. The delegate entry denies that capability, so the agent
   cannot edit policy while acting for the person.
 
-Then create `.local/lore.json` exactly in this schema — field names and nesting
-matter; do not invent variants such as `grants` or `permissions`:
+Then create root `lore.json` exactly in this schema and copy it to
+`.local/lore.json` for the disposable writable runtime. The root file is the
+committed policy blueprint; never copy runtime tokens, signing keys or private
+keys into it. Field names and nesting matter; do not invent variants such as
+`grants` or `permissions`:
 
 ```json
 {
@@ -183,6 +212,11 @@ matter; do not invent variants such as `grants` or `permissions`:
     "general": {
       "paths": ["/channel/general"],
       "access": { "allow": { "user": "rw", "agent": "rw" } }
+    },
+    "infrastructure": {
+      "paths": ["/channel/infrastructure"],
+      "access": { "allow": { "user": "rw", "agent": "rw" } },
+      "okf": { "patterns": ["*.md"] }
     }
   },
   "identities": [
@@ -210,17 +244,123 @@ matter; do not invent variants such as `grants` or `permissions`:
 Validate the complete JSON. A docset without an `access.allow` entry is
 reachable only as an identity's `home`, which is implicitly read/write for its
 owner. If the running server disagrees with this schema, trust
-`docs/configuration-and-identity.md` on the server (`cat
-/docs/configuration-and-identity.md` over SSH) over this template and report
+`docs/concepts/auth.md` on the server (`cat /docs/concepts/auth.md` over SSH) over this
+template and report
 the difference.
 
-Create both paths below `.local/filesystem/`. Put a short `README.md` in the
+Create all three paths below `content/`. Put a short `README.md` in the
 private home. Put a concise summary of the confirmed “Who is this for?” answer
 at the very top of `/channel/general/INDEX.md`, followed by useful organization,
 person, and team details without inventing facts. Do not overwrite user content.
 This is the initial SSH-visible filesystem. Do not put generated host private keys,
 signing keys, audit logs, tokens, or runtime databases in bootstrap state; each
 deployed server creates its own operational state.
+
+### Record the setup in `/channel/infrastructure`
+
+Tell the person in one sentence that you will keep a short, plain record of
+this setup in the `infrastructure` folder so anyone on the team — or any agent —
+can later see who set the server up, with what, and where it runs. Write it in
+the **Open Knowledge Format (OKF)**: markdown files with a small YAML header
+(frontmatter), which the `okf` rule above validates on every write. Define
+OKF only in that one sentence; do not lecture.
+
+Create the folder `content/channel/infrastructure/` with exactly
+three files. Fill every `<placeholder>` from facts confirmed in this session;
+never invent, and never record key material, private-key paths, tokens, or
+credentials. Agents are named `<agent name>/<model or version>` (for example
+`amp/claude-opus-4`) and people `human:<identity>`, which is OKF's actor
+convention. Use the current UTC time from `date -u +%Y-%m-%dT%H:%M:%SZ`.
+
+`index.md` (the folder listing; the only place `okf_version` belongs):
+
+```markdown
+---
+okf_version: "0.2"
+---
+
+# Infrastructure
+
+* [<team display name> Lore server](openlore-server.md) - How this OpenLore server was set up, who set it up, and where it runs.
+```
+
+`openlore-server.md` (the record — a living document that `setup`,
+`onboarding`, and `deploy` each update):
+
+```markdown
+---
+type: Infrastructure
+title: <team display name> Lore server
+description: How this OpenLore server was set up, who set it up, and where it runs.
+tags: [OpenLore, infrastructure, setup]
+author: human:onboarding
+generated: { by: <agent name>/<model or version>, at: <UTC now> }
+status: draft
+---
+
+# Summary
+
+<One or two sentences: who set up which server, with which agent, on which
+date, and that it currently runs only locally for verification until
+`deploy`.>
+
+# People and agents
+
+| Role  | Identity     | Details                                                        |
+| ----- | ------------ | -------------------------------------------------------------- |
+| Owner | onboarding   | <person or team name>; ssh-<key type> key                      |
+| Agent | <agent name> | <agent product and model or version>; delegate of `onboarding` |
+
+# Server
+
+| Item             | Value                                                   |
+| ---------------- | ------------------------------------------------------- |
+| Project          | `<team-slug>-lore` at `<absolute path>`                 |
+| OpenLore release | `ghcr.io/aakarim/openlore:<version>`                    |
+| Configuration    | root `openlore.yml` (Git/IaC authority)                 |
+| Local runtime    | <Go binary from source, or Compose with Docker/Podman>  |
+| Local ports      | SSH `<port>`, HTTP `<port>`                             |
+| Set up on        | <YYYY-MM-DD>                                            |
+
+# Identities and access
+
+| Identity     | Roles                  | Home               | Docsets and grants                          |
+| ------------ | ---------------------- | ------------------ | ------------------------------------------- |
+| onboarding   | administrator, user    | `/user/onboarding` | `general` rw, `infrastructure` rw           |
+| <agent name> | agent                  | —                  | `general` rw, `infrastructure` rw; delegate of `onboarding` without `lore:config:edit` |
+
+# Deployment
+
+Not deployed yet. The server runs only on <hostname or "this machine"> for
+local verification; `deploy` fills in this section.
+
+# Verification
+
+<Filled in at stage 7: which acceptance suite passed and when.>
+
+# History
+
+See [log.md](log.md) for every change to this record.
+```
+
+`log.md` (update history; no frontmatter, one `##` heading per ISO date,
+newest date first):
+
+```markdown
+# Log
+
+## <YYYY-MM-DD>
+
+**Creation** — `setup` created the project and this record as
+`<agent name>/<model or version>` for `human:onboarding`.
+```
+
+Keep the record current for the rest of setup: every later stage that learns a
+fact recorded above (runtime, ports, release, verification) updates the table,
+refreshes `generated.at`, and appends an `**Update**` line under today's date
+in `log.md` (reuse the day's heading; do not create a second one). Validate
+with `ssh -F .local/ssh_config lore-local 'lore validate /channel/infrastructure'`
+once the local server is running; a rejected write names the rule to fix.
 
 ## 5. Create disposable local runtime state
 
@@ -244,8 +384,9 @@ services:
       - "${OPENLORE_HTTP_PORT}:8080"
     volumes:
       - ../openlore.yml:/var/lib/openlore/config/openlore.yml:ro
+      - ../home:/var/lib/openlore/config/home:ro
       - ./lore.json:/var/lib/openlore/config/lore.json
-      - ./filesystem:/var/lib/openlore/published
+      - ../content:/var/lib/openlore/published
       - openlore-data:/var/lib/openlore/data
       - openlore-ssh:/var/lib/openlore/ssh
 volumes:
@@ -268,10 +409,20 @@ architecture:
    selected release.
 2. Remove that clone's embedded `assets/config/openlore.yml` before building,
    because a binary cannot load embedded and external configuration together.
-3. Build `./cmd/openlore` into an ignored local path.
+3. Build the web UI first so the local server includes the dashboard like the
+   published image: in the clone, run `npm --prefix dashboard ci` and
+   `npm --prefix dashboard run build`. Without this step Go builds a binary
+   with no dashboard and `/dashboard/` returns 404. If Node and npm are not
+   installed, tell the user the local server will have no dashboard, then
+   continue; the deployed image still includes it.
+   Then build `./cmd/openlore` into an ignored local path.
 4. Create an ignored `.local/openlore.local.yml` derived from root
    `openlore.yml`, replacing `/var/lib/openlore` paths with absolute paths below
-   this project's `.local/`. Do not modify the tracked production config.
+   this project's `.local/`, except `writable_dir`, which points at the absolute
+   `content/` path. Copy or symlink root `home/` beside it so the server
+   validates the same `home/*/sources.yaml` files.
+   Set `external_url` to the chosen local HTTP URL so `lore login` can find it.
+   Do not modify the tracked production config.
 5. Run the binary with `--config .local/openlore.local.yml`.
 
 Do not commit the clone, binary, or local config. Use Compose only when no
@@ -291,7 +442,11 @@ host-key checking or mutate global `~/.ssh/known_hosts`.
 Quietly run all checks; setup is not successful until they pass:
 
 1. HTTP readiness succeeds.
-2. `/mcp` completes an MCP initialization exchange.
+2. `/.well-known/oauth-authorization-server` and
+   `/.well-known/oauth-protected-resource` advertise the selected local HTTP
+   origin, JWKS publishes an ES256 key, unauthenticated `/mcp` returns 401, and
+   `/mcp` completes initialization with a bearer token minted for `onboarding`
+   from the active local config.
 3. `passkey` is available; the mounted config is active: keyless login fails,
    `ssh -F .local/ssh_config lore-local` authenticates `onboarding`, and
    `ssh -F .local/ssh_config lore-local-agent` authenticates the agent identity.
@@ -299,7 +454,9 @@ Quietly run all checks; setup is not successful until they pass:
 5. The home README and shared INDEX are visible; a unique disposable document can be
    written to `/channel/general`, read back, and removed — once as `onboarding`
    and once as the agent identity.
-6. After restarting the local server (container or Go process), authentication,
+6. `/channel/infrastructure/openlore-server.md` is readable by both identities
+   and `lore validate /channel/infrastructure` reports no errors.
+7. After restarting the local server (container or Go process), authentication,
    filesystem contents, and the SSH host key persist.
 
 Diagnose failures at their owning layer and rerun the failed check. After any
@@ -309,7 +466,15 @@ authentication or hardcode around a failed check.
 
 ## 7. Finish reviewably
 
-Initialize Git if needed. Show all tracked files and prove `.local/` is ignored.
+Bring the setup record up to date first: fill `# Server` (runtime, ports,
+release) and `# Verification` (“Local acceptance suite passed on <YYYY-MM-DD>
+as <agent name>/<model or version>”), refresh `generated.at`, add the
+`**Update**` line to `log.md`, and rerun `lore validate /channel/infrastructure`.
+Leave `status: draft` until `deploy` verifies a shared server.
+
+Initialize Git if needed. Show all tracked files and prove both `.local/` and
+`content/` are ignored. Keep per-machine `lore login` credentials only in
+`~/.config/lore/` (or `$XDG_CONFIG_HOME/lore/`), never in the blueprint.
 Finish with a friendly ✅ summary: what was created, which local runtime is
 serving (Go binary or Compose) and how to restart it, selected release version,
 local URLs, identity/home, ports, and key used. Do not narrate successful
@@ -318,6 +483,7 @@ internal checks. Give these commands for a new terminal:
 ```bash
 ssh -F .local/ssh_config lore-local
 ssh -F .local/ssh_config lore-local 'cat /channel/general/INDEX.md'
+ssh -F .local/ssh_config lore-local 'cat /channel/infrastructure/openlore-server.md'
 ```
 
 Offer an initial commit only after explicit approval; never push automatically.
@@ -328,3 +494,12 @@ similarly “run deploy” or `ssh openlore.sh deploy | <agent-cli>`, and its
 benefit is to share the server with the team. Explain that
 setup is complete and onboarding is optional customization. One project is one
 authoritative server; do not create staging environments.
+
+If the person stops here, open the finished setup record for them and say so:
+
+```bash
+open content/channel/infrastructure/openlore-server.md   # macOS
+xdg-open content/channel/infrastructure/openlore-server.md   # Linux
+```
+
+If neither opener exists, give the absolute path instead.

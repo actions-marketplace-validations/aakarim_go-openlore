@@ -2,19 +2,26 @@ package shell
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/aakarim/go-openlore/internal/analytics"
 	"github.com/aakarim/go-openlore/pkg/openlore/meta"
 	"github.com/aakarim/go-openlore/pkg/openlore/validation"
 	"github.com/aakarim/go-openlore/pkg/shell/cmds"
 	"github.com/aakarim/go-openlore/pkg/shell/parser"
 	"github.com/aakarim/go-openlore/pkg/vfs"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Shell is a restricted bash-like shell that operates over any vfs.FileSystem.
@@ -26,8 +33,10 @@ type Shell struct {
 	// "unrestricted" — every action is allowed (the default, backward
 	// compatible). When non-nil, a command (or redirect) whose capability
 	// class is absent is treated as if it does not exist.
-	allowedActions   map[cmds.Action]bool
-	actionAuthorizer func(cmds.Action) bool
+	allowedActions      map[cmds.Action]bool
+	actionAuthorizer    func(cmds.Action) bool
+	actionDeniedMessage string
+	writeDenialReason   func(resolvedPath string) error
 	// conflictPolicyFn resolves the write-conflict policy for a resolved path.
 	// nil means "use the default" (vfs.PolicyHash). The server sets this to a
 	// per-docset resolver; standalone shells get the default.
@@ -38,6 +47,11 @@ type Shell struct {
 	docsets                 []cmds.DocsetInfo
 	publishTargets          []cmds.PublishTarget
 	unsupportedUsageHandler func(UnsupportedUsage)
+	commandObserver         func(CommandExecution)
+	executionContext        context.Context
+	invocationID            string
+	commandEventID          string
+	pipelinePosition        int
 	// metaExtenders are the plugin-contributed extenders applied by `lore meta`,
 	// installed by the host per session. nil for a standalone shell.
 	metaExtenders []meta.Extender
@@ -47,11 +61,23 @@ type Shell struct {
 	skillsManagement     bool
 	skillsRemoteTimeout  time.Duration
 	skillsRemoteMaxBytes int64
+	sshTarget            string
 	attribution          cmds.JobAttribution
 	configReload         cmds.ConfigReloadBackend
+	configPlugins        map[string]string
+	sourceLister         func() ([]cmds.SourceInfo, error)
 	history              cmds.HistoryBackend
 	jobs                 cmds.JobBackend
+	size                 cmds.SizeBackend
+	analytics            *analytics.Service
+	analyticsAuthorizer  func() error
+	facts                analytics.ContentFacts
+	metricEmitter        func(context.Context, string, map[string]any)
+	invocationObserver   func(string, string)
 	exitRequested        bool
+	// lastExit is the status of the most recently completed statement, which
+	// `$?` expands to.
+	lastExit int
 }
 
 // UnsupportedUsage describes a command or shell syntax that OpenLore does not
@@ -62,6 +88,18 @@ type UnsupportedUsage struct {
 	Command string
 	Syntax  string
 	Error   string
+}
+
+type CommandExecution struct {
+	Context          context.Context
+	Command          string
+	Argc             int
+	ExitCode         int
+	Duration         time.Duration
+	BytesOut         int64
+	PipelinePosition int
+	InvocationID     string
+	EventID          string
 }
 
 // NewShell creates a new Shell backed by the given vfs.FileSystem.
@@ -77,6 +115,8 @@ func NewShell(fs vfs.FileSystem) *Shell {
 func (s *Shell) SetUnsupportedUsageHandler(handler func(UnsupportedUsage)) {
 	s.unsupportedUsageHandler = handler
 }
+
+func (s *Shell) SetCommandObserver(observer func(CommandExecution)) { s.commandObserver = observer }
 
 // SetAllowedActions restricts the shell to the given capability classes
 // (Part B). Passing nil (or not calling this) leaves the shell unrestricted.
@@ -105,6 +145,17 @@ func (s *Shell) ActionAllowed(a cmds.Action) bool {
 // SetActionAuthorizer installs a per-invocation narrowing check.
 func (s *Shell) SetActionAuthorizer(fn func(cmds.Action) bool) { s.actionAuthorizer = fn }
 
+// SetActionDeniedMessage makes capability denials explicit instead of hiding
+// the denied command. An empty message retains the default "command not found"
+// behavior.
+func (s *Shell) SetActionDeniedMessage(message string) { s.actionDeniedMessage = message }
+
+// SetWriteDenialReason explains a redirect blocked by the shell's capability
+// gate without attempting a mutation. It does not grant write authority.
+func (s *Shell) SetWriteDenialReason(fn func(resolvedPath string) error) {
+	s.writeDenialReason = fn
+}
+
 // SetConflictPolicyFn installs a resolver that maps a resolved path to its
 // write-conflict policy. Passing nil restores the default (vfs.PolicyHash).
 func (s *Shell) SetConflictPolicyFn(fn func(resolvedPath string) vfs.WriteConflictPolicy) {
@@ -126,11 +177,26 @@ func (s *Shell) SetDocsets(d []cmds.DocsetInfo) { s.docsets = d }
 // Docsets reports the per-session docset views. Implements CmdContext.
 func (s *Shell) Docsets() []cmds.DocsetInfo { return s.docsets }
 
+func (s *Shell) SetSourceLister(list func() ([]cmds.SourceInfo, error)) { s.sourceLister = list }
+func (s *Shell) Sources() ([]cmds.SourceInfo, error) {
+	if s.sourceLister == nil {
+		return nil, nil
+	}
+	return s.sourceLister()
+}
+
 // SetPublishTargets installs the per-session publish inboxes used by `publish`.
 func (s *Shell) SetPublishTargets(t []cmds.PublishTarget) { s.publishTargets = t }
 
 // PublishTargets reports the per-session publish inboxes. Implements CmdContext.
 func (s *Shell) PublishTargets() []cmds.PublishTarget { return s.publishTargets }
+
+// SetSSHTarget installs the ssh arguments that reach this host, substituted
+// into skills that carry the {{ ssh_target }} placeholder.
+func (s *Shell) SetSSHTarget(target string) { s.sshTarget = target }
+
+// SSHTarget reports the ssh arguments installed by SetSSHTarget.
+func (s *Shell) SSHTarget() string { return s.sshTarget }
 
 // SetMetaExtenders installs the plugin-contributed extenders applied by `lore
 // meta`.
@@ -158,10 +224,58 @@ func (s *Shell) SetCommandAttribution(a cmds.JobAttribution)       { s.attributi
 func (s *Shell) CommandAttribution() cmds.JobAttribution           { return s.attribution }
 func (s *Shell) SetConfigReloadBackend(b cmds.ConfigReloadBackend) { s.configReload = b }
 func (s *Shell) ConfigReloadBackend() cmds.ConfigReloadBackend     { return s.configReload }
+func (s *Shell) SetConfigPlugins(plugins map[string]string)        { s.configPlugins = plugins }
+func (s *Shell) ConfigPlugins() map[string]string                  { return s.configPlugins }
 func (s *Shell) SetHistoryBackend(b cmds.HistoryBackend)           { s.history = b }
 func (s *Shell) HistoryBackend() cmds.HistoryBackend               { return s.history }
 func (s *Shell) SetJobBackend(b cmds.JobBackend)                   { s.jobs = b }
 func (s *Shell) JobBackend() cmds.JobBackend                       { return s.jobs }
+func (s *Shell) SetSizeBackend(b cmds.SizeBackend)                 { s.size = b }
+func (s *Shell) SizeBackend() cmds.SizeBackend                     { return s.size }
+
+func (s *Shell) SetAnalytics(service *analytics.Service) {
+	s.analytics = service
+	if service != nil && s.facts == nil {
+		s.facts = analytics.NewContentFacts(s.fs)
+	}
+}
+func (s *Shell) Analytics() *analytics.Service { return s.analytics }
+
+// SetAnalyticsAuthorizer installs a live authorization check for instance-wide
+// analytics operations. fn returns nil to allow, or an error naming the failed
+// condition. Without an authorizer, those operations are denied.
+func (s *Shell) SetAnalyticsAuthorizer(fn func() error) { s.analyticsAuthorizer = fn }
+
+// AnalyticsAdminDenial returns nil when instance-wide analytics is allowed, or
+// an error that names why it is denied.
+func (s *Shell) AnalyticsAdminDenial() error {
+	if s.analyticsAuthorizer == nil {
+		return errors.New("instance-wide analytics requires lore:analytics:admin and full token scope, and this shell host has no analytics authorizer")
+	}
+	return s.analyticsAuthorizer()
+}
+func (s *Shell) SetFacts(facts analytics.ContentFacts) { s.facts = facts }
+func (s *Shell) Facts() analytics.ContentFacts         { return s.facts }
+func (s *Shell) SetMetricEmitter(fn func(context.Context, string, map[string]any)) {
+	s.metricEmitter = fn
+}
+func (s *Shell) EmitMetric(ctx context.Context, eventType string, fields map[string]any) {
+	if s.metricEmitter != nil {
+		s.metricEmitter(analytics.ContextWithInvocation(ctx, s.invocationID, s.commandEventID), eventType, fields)
+	}
+}
+
+// Context returns the current invocation or command context. A Shell is
+// stateful and must not be executed concurrently, with or without tracing.
+func (s *Shell) Context() context.Context {
+	if s.executionContext != nil {
+		return s.executionContext
+	}
+	return context.Background()
+}
+
+func (s *Shell) MetricsEnabled() bool                          { return s.metricEmitter != nil }
+func (s *Shell) SetInvocationObserver(fn func(string, string)) { s.invocationObserver = fn }
 
 // --- CmdContext interface implementation ---
 
@@ -204,17 +318,85 @@ func (s *Shell) AllEnv() map[string]string {
 
 // Exec parses and executes a single command line.
 func (s *Shell) Exec(cmdLine string, w io.Writer, errW io.Writer, stdin io.Reader) int {
-	return s.execLine(cmdLine, w, errW, stdin)
+	return s.ExecPipeline(cmdLine, w, errW, stdin)
+}
+
+// ExecArgs executes an already-tokenized command without parsing its arguments
+// as shell source.
+func (s *Shell) ExecArgs(args []string, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	if len(args) == 0 {
+		return s.execArgs(args, w, errW, stdin)
+	}
+	command := args[0]
+	return s.observeCommand(&command, len(args)-1, w, func(out io.Writer) int {
+		return s.execArgs(args, out, errW, stdin)
+	})
+}
+
+func (s *Shell) observeCommand(command *string, argc int, w io.Writer, run func(io.Writer) int) int {
+	previousContext := s.executionContext
+	ctx, span := otel.Tracer("github.com/aakarim/go-openlore/shell").Start(s.Context(), "openlore.command")
+	s.executionContext = ctx
+	defer func() { s.executionContext = previousContext; span.End() }()
+	eventID := analytics.NewID()
+	parentEventID := s.commandEventID
+	s.commandEventID = eventID
+	defer func() { s.commandEventID = parentEventID }()
+	if s.invocationObserver != nil {
+		s.invocationObserver(s.invocationID, eventID)
+		defer s.invocationObserver(s.invocationID, parentEventID)
+	}
+	position := s.pipelinePosition
+	s.pipelinePosition++
+	counter := &countingWriter{Writer: w}
+	started := time.Now()
+	code := run(counter)
+	// The executor fills the expanded name, without evaluating source twice.
+	// Unknown command names can be arbitrary user content, not just verbs.
+	name := *command
+	if _, known := cmds.Registry[name]; !known && name != "pwd" && name != "exit" && name != "quit" {
+		name = "unknown"
+	}
+	span.SetAttributes(attribute.String("openlore.command.name", name), attribute.Int("openlore.command.argc", argc), attribute.Int("openlore.exit_code", code), attribute.Int64("openlore.bytes_out", counter.n), attribute.String("openlore.invocation_id", s.invocationID), attribute.Int("openlore.pipeline_position", position))
+	if code != 0 {
+		span.SetStatus(codes.Error, "command failed")
+	}
+	if s.commandObserver != nil {
+		s.commandObserver(CommandExecution{Context: ctx, Command: *command, Argc: argc, ExitCode: code, Duration: time.Since(started), BytesOut: counter.n, PipelinePosition: position, InvocationID: s.invocationID, EventID: eventID})
+	}
+	return code
 }
 
 // ExecPipeline parses a shell line and executes the resulting AST.
 // stdin is optional — pass nil if no external stdin is available.
 func (s *Shell) ExecPipeline(line string, w io.Writer, errW io.Writer, stdin io.Reader) int {
-	return s.execLine(line, w, errW, stdin)
+	return s.ExecPipelineContext(s.Context(), line, w, errW, stdin)
+}
+
+// ExecPipelineContext executes a shell invocation beneath the caller's trace.
+// Arguments, source text, paths and output are never added to spans.
+func (s *Shell) ExecPipelineContext(ctx context.Context, line string, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	previousContext := s.executionContext
+	previousInvocation, previousEvent, previousPosition := s.invocationID, s.commandEventID, s.pipelinePosition
+	ctx, span := otel.Tracer("github.com/aakarim/go-openlore/shell").Start(ctx, "openlore.shell")
+	s.executionContext = ctx
+	defer func() {
+		s.executionContext = previousContext
+		s.invocationID, s.commandEventID, s.pipelinePosition = previousInvocation, previousEvent, previousPosition
+		span.End()
+	}()
+	code := s.execLine(line, w, errW, stdin)
+	span.SetAttributes(attribute.String("openlore.invocation_id", s.invocationID), attribute.Int("openlore.exit_code", code))
+	if code != 0 {
+		span.SetStatus(codes.Error, "shell invocation failed")
+	}
+	return code
 }
 
 func (s *Shell) execLine(line string, w io.Writer, errW io.Writer, stdin io.Reader) int {
 	s.exitRequested = false
+	s.invocationID = analytics.NewID()
+	s.pipelinePosition = 0
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return 0
@@ -234,17 +416,32 @@ func (s *Shell) execLine(line string, w io.Writer, errW io.Writer, stdin io.Read
 			})
 		}
 		fmt.Fprintf(errW, "parse error: %s\n", err)
+		s.lastExit = 2
 		return 2
 	}
 
-	var exitCode int
-	for _, stmt := range f.Stmts {
-		exitCode = s.execStmt(stmt, w, errW, stdin)
+	return s.execStmts(f.Stmts, w, errW, stdin)
+}
+
+// execStmts runs a statement list and stops after a statement that ran
+// `exit`, returning that statement's status.
+func (s *Shell) execStmts(stmts []*parser.Stmt, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	var code int
+	for _, st := range stmts {
+		code = s.execStmt(st, w, errW, stdin)
 		if s.exitRequested {
 			break
 		}
 	}
-	return exitCode
+	return code
+}
+
+// execIsolated runs a subshell body. `exit` inside it ends only the body; its
+// status becomes the subshell's status.
+func (s *Shell) execIsolated(stmts []*parser.Stmt, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	code := s.execStmts(stmts, w, errW, stdin)
+	s.exitRequested = false
+	return code
 }
 
 func (s *Shell) execStmt(stmt *parser.Stmt, w io.Writer, errW io.Writer, stdin io.Reader) int {
@@ -254,7 +451,8 @@ func (s *Shell) execStmt(stmt *parser.Stmt, w io.Writer, errW io.Writer, stdin i
 
 	code := s.execCmd(stmt.Cmd, w, errW, stdin)
 
-	if stmt.Negated {
+	// `! exit N` exits with N: exit never returns for `!` to negate.
+	if stmt.Negated && !s.exitRequested {
 		if code == 0 {
 			code = 1
 		} else {
@@ -262,6 +460,7 @@ func (s *Shell) execStmt(stmt *parser.Stmt, w io.Writer, errW io.Writer, stdin i
 		}
 	}
 
+	s.lastExit = code
 	return code
 }
 
@@ -274,18 +473,10 @@ func (s *Shell) execCmd(cmd parser.Command, w io.Writer, errW io.Writer, stdin i
 		return s.execBinary(c, w, errW, stdin)
 
 	case *parser.Subshell:
-		var code int
-		for _, st := range c.Stmts {
-			code = s.execStmt(st, w, errW, stdin)
-		}
-		return code
+		return s.execIsolated(c.Stmts, w, errW, stdin)
 
 	case *parser.Block:
-		var code int
-		for _, st := range c.Stmts {
-			code = s.execStmt(st, w, errW, stdin)
-		}
-		return code
+		return s.execStmts(c.Stmts, w, errW, stdin)
 
 	case *parser.IfClause:
 		return s.execIf(c, w, errW, stdin)
@@ -325,6 +516,32 @@ func (s *Shell) execCmd(cmd parser.Command, w io.Writer, errW io.Writer, stdin i
 }
 
 func (s *Shell) execCall(call *parser.CallExpr, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	if len(call.Args) == 0 {
+		return s.execCallObserved(call, w, errW, stdin, nil)
+	}
+	command := "unknown"
+	if len(call.Args[0].Parts) == 1 {
+		if literal, ok := call.Args[0].Parts[0].(*parser.Lit); ok {
+			command = literal.Value
+		}
+	}
+	return s.observeCommand(&command, len(call.Args)-1, w, func(out io.Writer) int {
+		return s.execCallObserved(call, out, errW, stdin, &command)
+	})
+}
+
+type countingWriter struct {
+	io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+func (s *Shell) execCallObserved(call *parser.CallExpr, w io.Writer, errW io.Writer, stdin io.Reader, command *string) int {
 	// A `> file` / `>> file` redirection buffers the command's stdout and
 	// commits it as a single atomic whole-object write. Nothing is committed
 	// unless the command succeeds (commit-on-success only — no half-files).
@@ -334,34 +551,44 @@ func (s *Shell) execCall(call *parser.CallExpr, w io.Writer, errW io.Writer, std
 		// It does not require write capability because it cannot mutate state.
 		if target == "/dev/null" {
 			if call.Redirect.Stderr {
-				return s.execCallInner(call, w, io.Discard, stdin)
+				return s.execCallInner(call, w, io.Discard, stdin, command)
 			}
-			return s.execCallInner(call, io.Discard, errW, stdin)
+			return s.execCallInner(call, io.Discard, errW, stdin, command)
 		}
 		// A file redirect is a write; gate it at parse time (Part B) so a
 		// read-only session cannot use `>`/`>>` to mutate a docset.
 		if !s.ActionAllowed(cmds.ActionWrite) {
+			if s.actionDeniedMessage != "" {
+				fmt.Fprintf(errW, "redirect: %s: %s\n", target, s.actionDeniedMessage)
+				return 1
+			}
+			if s.writeDenialReason != nil {
+				if err := s.writeDenialReason(s.Resolve(target)); err != nil {
+					fmt.Fprintf(errW, "redirect: %s: %s\n", target, err)
+					return 1
+				}
+			}
 			fmt.Fprintf(errW, "redirect: %s: read-only filesystem\n", target)
 			return 1
 		}
 		var buf bytes.Buffer
 		if call.Redirect.Stderr {
-			code := s.execCallInner(call, w, &buf, stdin)
+			code := s.execCallInner(call, w, &buf, stdin, command)
 			if redirectCode := cmds.WriteFileMsg(s, errW, "redirect", target, buf.Bytes(), call.Redirect.Append); redirectCode != 0 {
 				return redirectCode
 			}
 			return code
 		}
-		code := s.execCallInner(call, &buf, errW, stdin)
+		code := s.execCallInner(call, &buf, errW, stdin, command)
 		if code != 0 {
 			return code
 		}
 		return cmds.WriteFileMsg(s, errW, "redirect", target, buf.Bytes(), call.Redirect.Append)
 	}
-	return s.execCallInner(call, w, errW, stdin)
+	return s.execCallInner(call, w, errW, stdin, command)
 }
 
-func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer, stdin io.Reader) int {
+func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer, stdin io.Reader, command *string) int {
 	if len(call.Args) == 0 {
 		for _, assign := range call.Assigns {
 			s.SetEnv(assign.Name.Value, s.expandWord(assign.Value))
@@ -371,11 +598,9 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 
 	args := make([]string, 0, len(call.Args))
 	for _, word := range call.Args {
-		expanded := s.expandWord(word)
-		// Only glob-expand unquoted words that have a directory component
-		// (e.g. /docs/*.md but not *.md alone, which is likely a find pattern)
-		if !isQuotedWord(word) && strings.ContainsAny(expanded, "*?") && strings.Contains(expanded, "/") {
-			matches := s.globExpand(expanded)
+		expanded, globPattern, hasGlob := s.expandGlobWord(word)
+		if hasGlob {
+			matches := s.globExpand(globPattern)
 			if len(matches) > 0 {
 				args = append(args, matches...)
 				continue
@@ -383,9 +608,7 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 		}
 		args = append(args, expanded)
 	}
-
-	cmdName := args[0]
-	cmdArgs := args[1:]
+	*command = args[0]
 
 	// A heredoc on the command replaces stdin with the heredoc body. We
 	// concatenate multiple heredoc bodies in declaration order to match bash.
@@ -401,14 +624,21 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 	if call.MergeStderr {
 		errW = w
 	}
+	return s.execArgs(args, w, errW, stdin)
+}
 
+func (s *Shell) execArgs(args []string, w io.Writer, errW io.Writer, stdin io.Reader) int {
+	if len(args) == 0 {
+		return 0
+	}
+	cmdName := args[0]
+	cmdArgs := args[1:]
 	if cmdName == "pwd" {
 		fmt.Fprintln(w, s.cwd)
 		return 0
 	}
 	if cmdName == "exit" || cmdName == "quit" {
-		s.exitRequested = true
-		return 0
+		return s.exit(cmdName, cmdArgs, errW)
 	}
 
 	if fn, ok := cmds.Registry[cmdName]; ok {
@@ -416,6 +646,10 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 		// not allowed to perform is hidden — it reports "command not found"
 		// so the restricted surface is not even discoverable.
 		if !s.ActionAllowed(cmds.InvocationAction(cmdName, cmdArgs)) {
+			if s.actionDeniedMessage != "" {
+				fmt.Fprintf(errW, "%s: %s\n", cmdName, s.actionDeniedMessage)
+				return 1
+			}
 			fmt.Fprintf(errW, "%s: command not found\n", cmdName)
 			fmt.Fprintln(errW, "Type 'help' for available commands.")
 			return 127
@@ -431,29 +665,60 @@ func (s *Shell) execCallInner(call *parser.CallExpr, w io.Writer, errW io.Writer
 	return 127
 }
 
+// exit ends the current shell (the invocation, or the enclosing subshell)
+// with status N, or with $? when N is omitted, as in POSIX sh.
+func (s *Shell) exit(name string, args []string, errW io.Writer) int {
+	s.exitRequested = true
+	if len(args) == 0 {
+		return s.lastExit
+	}
+	code, err := strconv.Atoi(args[0])
+	if err != nil {
+		fmt.Fprintf(errW, "%s: %s: numeric argument required\n", name, args[0])
+		return 2
+	}
+	if len(args) > 1 {
+		fmt.Fprintf(errW, "%s: too many arguments\n", name)
+		return 1
+	}
+	return code & 0xff
+}
+
+// ExitRequested reports whether the last executed line ran `exit` outside a
+// subshell. `source` uses it to stop the sourced file and the caller.
+func (s *Shell) ExitRequested() bool { return s.exitRequested }
+
 func (s *Shell) execBinary(bc *parser.BinaryCmd, w io.Writer, errW io.Writer, stdin io.Reader) int {
 	switch bc.Op {
 	case parser.Pipe:
+		// Pipeline operands run concurrently in bash, so each one sees the
+		// $? from before the pipeline, not the status of its left neighbour.
+		// Each operand is also its own subshell, so `exit` in one ends only
+		// that operand.
+		prev := s.lastExit
 		var buf bytes.Buffer
-		s.execStmt(bc.X, &buf, errW, stdin)
-		return s.execStmt(bc.Y, w, errW, &buf)
+		s.execIsolated([]*parser.Stmt{bc.X}, &buf, errW, stdin)
+		s.lastExit = prev
+		return s.execIsolated([]*parser.Stmt{bc.Y}, w, errW, &buf)
 
 	case parser.PipeAll:
+		prev := s.lastExit
 		var buf bytes.Buffer
-		s.execStmt(bc.X, &buf, &buf, stdin)
-		return s.execStmt(bc.Y, w, errW, &buf)
+		s.execIsolated([]*parser.Stmt{bc.X}, &buf, &buf, stdin)
+		s.lastExit = prev
+		return s.execIsolated([]*parser.Stmt{bc.Y}, w, errW, &buf)
 
 	case parser.AndStmt:
 		code := s.execStmt(bc.X, w, errW, stdin)
-		if code != 0 {
+		if code != 0 || s.exitRequested {
 			return code
 		}
 		return s.execStmt(bc.Y, w, errW, stdin)
 
 	case parser.OrStmt:
 		code := s.execStmt(bc.X, w, errW, stdin)
-		if code == 0 {
-			return 0
+		if code == 0 || s.exitRequested {
+			return code
 		}
 		return s.execStmt(bc.Y, w, errW, stdin)
 
@@ -466,24 +731,16 @@ func (s *Shell) execBinary(bc *parser.BinaryCmd, w io.Writer, errW io.Writer, st
 func (s *Shell) execIf(ic *parser.IfClause, w io.Writer, errW io.Writer, stdin io.Reader) int {
 	// Plain else: Cond is nil
 	if ic.Cond == nil {
-		var code int
-		for _, st := range ic.Then {
-			code = s.execStmt(st, w, errW, stdin)
-		}
-		return code
+		return s.execStmts(ic.Then, w, errW, stdin)
 	}
 
-	var condCode int
-	for _, st := range ic.Cond {
-		condCode = s.execStmt(st, io.Discard, errW, stdin)
+	condCode := s.execStmts(ic.Cond, io.Discard, errW, stdin)
+	if s.exitRequested {
+		return condCode
 	}
 
 	if condCode == 0 {
-		var code int
-		for _, st := range ic.Then {
-			code = s.execStmt(st, w, errW, stdin)
-		}
-		return code
+		return s.execStmts(ic.Then, w, errW, stdin)
 	}
 
 	if ic.Else != nil {
@@ -496,9 +753,9 @@ func (s *Shell) execIf(ic *parser.IfClause, w io.Writer, errW io.Writer, stdin i
 func (s *Shell) execWhile(wc *parser.WhileClause, w io.Writer, errW io.Writer, stdin io.Reader) int {
 	var code int
 	for i := 0; i < 10000; i++ {
-		var condCode int
-		for _, st := range wc.Cond {
-			condCode = s.execStmt(st, io.Discard, errW, stdin)
+		condCode := s.execStmts(wc.Cond, io.Discard, errW, stdin)
+		if s.exitRequested {
+			return condCode
 		}
 		shouldRun := condCode == 0
 		if wc.Until {
@@ -507,8 +764,9 @@ func (s *Shell) execWhile(wc *parser.WhileClause, w io.Writer, errW io.Writer, s
 		if !shouldRun {
 			break
 		}
-		for _, st := range wc.Do {
-			code = s.execStmt(st, w, errW, stdin)
+		code = s.execStmts(wc.Do, w, errW, stdin)
+		if s.exitRequested {
+			break
 		}
 	}
 	return code
@@ -529,8 +787,9 @@ func (s *Shell) execFor(fc *parser.ForClause, w io.Writer, errW io.Writer, stdin
 	var code int
 	for _, item := range items {
 		s.SetEnv(varName, item)
-		for _, st := range fc.Do {
-			code = s.execStmt(st, w, errW, stdin)
+		code = s.execStmts(fc.Do, w, errW, stdin)
+		if s.exitRequested {
+			break
 		}
 	}
 	return code
@@ -594,6 +853,43 @@ func (s *Shell) expandWord(word *parser.Word) string {
 	return sb.String()
 }
 
+// expandGlobWord expands a word while retaining which wildcard characters
+// came from unquoted, unescaped parts and are therefore eligible for globbing.
+func (s *Shell) expandGlobWord(word *parser.Word) (expanded, pattern string, hasGlob bool) {
+	if word == nil {
+		return "", "", false
+	}
+
+	var expandedBuilder, patternBuilder strings.Builder
+	for i, part := range word.Parts {
+		str := s.expandPart(part)
+		if i == 0 {
+			if _, ok := part.(*parser.Lit); ok {
+				str = s.expandTilde(str)
+			}
+		}
+		expandedBuilder.WriteString(str)
+
+		switch part.(type) {
+		case *parser.SglQuoted, *parser.DblQuoted, *parser.Escaped:
+			patternBuilder.WriteString(escapeGlobPattern(str))
+		default:
+			patternBuilder.WriteString(str)
+			hasGlob = hasGlob || strings.ContainsAny(str, "*?")
+		}
+	}
+	return expandedBuilder.String(), patternBuilder.String(), hasGlob
+}
+
+func escapeGlobPattern(value string) string {
+	return strings.NewReplacer(
+		`\`, `\\`,
+		`*`, `\*`,
+		`?`, `\?`,
+		`[`, `\[`,
+	).Replace(value)
+}
+
 // expandTilde replaces a leading ~ (as `~` or `~/…`) with $HOME. If HOME is
 // unset the tilde is left untouched, matching bash.
 func (s *Shell) expandTilde(v string) string {
@@ -615,6 +911,9 @@ func (s *Shell) expandPart(part parser.WordPart) string {
 	case *parser.Lit:
 		return p.Value
 
+	case *parser.Escaped:
+		return p.Value
+
 	case *parser.SglQuoted:
 		return p.Value
 
@@ -630,9 +929,7 @@ func (s *Shell) expandPart(part parser.WordPart) string {
 
 	case *parser.CmdSubst:
 		var buf bytes.Buffer
-		for _, st := range p.Stmts {
-			s.execStmt(st, &buf, io.Discard, nil)
-		}
+		s.execIsolated(p.Stmts, &buf, io.Discard, nil)
 		return strings.TrimRight(buf.String(), "\n")
 
 	default:
@@ -645,7 +942,7 @@ func (s *Shell) expandParam(pe *parser.ParamExp) string {
 
 	switch name {
 	case "?":
-		return "0"
+		return fmt.Sprintf("%d", s.lastExit)
 	case "#":
 		return s.GetEnv("#")
 	case "0":
@@ -699,20 +996,6 @@ func (s *Shell) expandParam(pe *parser.ParamExp) string {
 	return val
 }
 
-// isQuotedWord returns true if the word is wrapped in quotes (single or double).
-func isQuotedWord(word *parser.Word) bool {
-	if word == nil || len(word.Parts) == 0 {
-		return false
-	}
-	for _, part := range word.Parts {
-		switch part.(type) {
-		case *parser.SglQuoted, *parser.DblQuoted:
-			return true
-		}
-	}
-	return false
-}
-
 // globExpand expands a glob pattern against the virtual filesystem.
 func (s *Shell) globExpand(pattern string) []string {
 	dir := path.Dir(s.Resolve(pattern))
@@ -725,6 +1008,9 @@ func (s *Shell) globExpand(pattern string) []string {
 
 	var matches []string
 	for _, entry := range entries {
+		if strings.HasPrefix(entry.FileName, ".") && !strings.HasPrefix(base, ".") {
+			continue
+		}
 		matched, _ := path.Match(base, entry.FileName)
 		if matched {
 			matches = append(matches, path.Join(dir, entry.FileName))
@@ -738,6 +1024,7 @@ func (s *Shell) globExpand(pattern string) []string {
 // shell. WidthChanges may be nil. Non-positive widths use an 80-column
 // fallback.
 type InteractiveOptions struct {
+	Context      context.Context
 	Width        int
 	WidthChanges <-chan int
 }
@@ -752,6 +1039,11 @@ func (s *Shell) RunInteractive(rw io.ReadWriter, errW io.Writer, motd string, pr
 // an allocated PTY, the session's ptyWriter already converts \n to \r\n, so no
 // additional CRLFWriter wrapping is needed.
 func (s *Shell) RunInteractiveWithOptions(rw io.ReadWriter, errW io.Writer, motd string, prompt string, opts InteractiveOptions) {
+	previousContext := s.executionContext
+	if opts.Context != nil {
+		s.executionContext = opts.Context
+	}
+	defer func() { s.executionContext = previousContext }()
 	if motd != "" {
 		fmt.Fprintln(rw, motd)
 		fmt.Fprintln(rw, "")

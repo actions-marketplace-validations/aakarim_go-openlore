@@ -104,6 +104,46 @@ func TestMCPHTTPSessionLifecyclePreservesShellState(t *testing.T) {
 	}
 }
 
+func TestMCPHTTPSessionShellCommandFailureIsResult(t *testing.T) {
+	_, handler := newSessionTestAPI(t)
+	identity := Identity{IdentityName: "adil", Principal: AuthenticatedPrincipal{Subject: "adil"}, Attribution: Attribution{Principal: "adil"}, Scopes: []string{ScopeFull}}
+	created := createSession(t, handler, identity)
+	path := "/api/sessions/" + created.ID + "/shell"
+
+	w := sessionRequest(t, handler, identity, http.MethodPost, path, `{"command":"cat /does/not/exist"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var resp toolResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.IsError {
+		t.Fatalf("completed shell invocation is_error = true; body = %+v", resp)
+	}
+	if resp.ExitCode != 1 {
+		t.Fatalf("exit_code = %d, want 1", resp.ExitCode)
+	}
+	if resp.Stdout != "" {
+		t.Fatalf("stdout = %q, want empty", resp.Stdout)
+	}
+	stderrLower := strings.ToLower(resp.Stderr)
+	if !strings.Contains(stderrLower, "not exist") && !strings.Contains(stderrLower, "no such") {
+		t.Fatalf("stderr = %q, want missing-file diagnostic", resp.Stderr)
+	}
+	if resp.Output != resp.Stderr {
+		t.Fatalf("output = %q, want backwards-compatible merged stderr %q", resp.Output, resp.Stderr)
+	}
+
+	w = sessionRequest(t, handler, identity, http.MethodPost, path, `{"command":"pwd"}`)
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.IsError || resp.ExitCode != 0 {
+		t.Fatalf("success reported as failure: %+v", resp)
+	}
+}
+
 func TestMCPHTTPSessionIsBoundToIdentity(t *testing.T) {
 	_, handler := newSessionTestAPI(t)
 	owner := Identity{IdentityName: "owner", Principal: AuthenticatedPrincipal{Subject: "owner"}, Attribution: Attribution{Principal: "owner"}, Scopes: []string{ScopeFull}}
@@ -122,6 +162,11 @@ func TestMCPHTTPSessionIsBoundToIdentity(t *testing.T) {
 func TestMCPHTTPSessionExpiresAfterIdleTimeout(t *testing.T) {
 	api, handler := newSessionTestAPI(t)
 	identity := Identity{IdentityName: "adil", Principal: AuthenticatedPrincipal{Subject: "adil"}, Attribution: Attribution{Principal: "adil"}, Scopes: []string{ScopeFull}}
+	ended := make(chan Identity, 1)
+	api.sessions.onEnd = func(ctx context.Context, _ string, _ time.Duration) {
+		id, _ := ctx.Value(identityCtxKey{}).(Identity)
+		ended <- id
+	}
 	created := createSession(t, handler, identity)
 
 	api.sessions.mu.Lock()
@@ -132,6 +177,14 @@ func TestMCPHTTPSessionExpiresAfterIdleTimeout(t *testing.T) {
 	w := sessionRequest(t, handler, identity, http.MethodPost, path, `{"command":"pwd"}`)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expired session status = %d, want 404; body = %s", w.Code, w.Body.String())
+	}
+	select {
+	case got := <-ended:
+		if got.IdentityName != identity.IdentityName || got.Attribution.String() != identity.Attribution.String() {
+			t.Fatalf("expiry identity = %+v, want original attribution %+v", got, identity)
+		}
+	default:
+		t.Fatal("expiry did not invoke end observer")
 	}
 }
 

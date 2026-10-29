@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"fmt"
+	"encoding/json"
 	"sort"
 	"strings"
 
@@ -13,6 +13,11 @@ import (
 	"github.com/aakarim/go-openlore/pkg/shell/cmds"
 	"github.com/aakarim/go-openlore/pkg/vfs"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // MCPOption configures the MCP server constructed by NewMCPServer.
@@ -89,7 +94,7 @@ func NewMCPServer(fs vfs.FileSystem, opts ...MCPOption) *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    serverName,
-			Version: "1.0.0",
+			Version: assets.Version(),
 			Icons: []mcp.Icon{{
 				Source:   "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(assets.OiyaIcon()),
 				MIMEType: "image/svg+xml",
@@ -98,15 +103,16 @@ func NewMCPServer(fs vfs.FileSystem, opts ...MCPOption) *mcp.Server {
 		},
 		serverOpts,
 	)
+	server.AddReceivingMiddleware(mcpTracingMiddleware)
 
-	shellDesc := "Execute a command in OpenLore's restricted knowledge-base shell. This is not Bash and cannot run arbitrary executables. Supports ls, cat, grep, find, tree, head, tail, wc, stat, sort, uniq, cut, sed, awk, jq, xargs, pipes, loops, and more; use list_commands for the available surface."
+	shellDesc := "Run a command in OpenLore's restricted, Bash-like knowledge-repository shell. It cannot run arbitrary executables and never touches the local machine. Supports ls, cat, grep, find, tree, head, tail, wc, stat, sort, uniq, cut, sed, awk, jq, xargs, pipes, loops, heredocs, and more; use list_commands for the available surface. For multi-line writes, include a heredoc in the command string: cat <<'EOF' > /path followed by a newline, the body, and EOF alone on the final line. Write permissions still apply."
 	if cfg.shellDescription != "" {
 		shellDesc = cfg.shellDescription
 	}
 	destructive := !cfg.readOnly
 	openWorld := false
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "shell",
+		Name:        "lore_bash",
 		Description: shellDesc,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "OpenLore Shell",
@@ -128,6 +134,65 @@ func NewMCPServer(fs vfs.FileSystem, opts ...MCPOption) *mcp.Server {
 	}, newMCPListCommandsHandler())
 
 	return server
+}
+
+func mcpTracingMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if method != "tools/call" && method != "tools/list" {
+			return next(ctx, method, req)
+		}
+		// HTTP sessions inherit their initialization context in the SDK, but
+		// Extra contains this request's headers. Never reuse an old parent.
+		hasHTTPHeaders := false
+		if extra := req.GetExtra(); extra != nil && extra.Header != nil {
+			hasHTTPHeaders = true
+			ctx = trace.ContextWithSpanContext(ctx, trace.SpanContext{})
+			ctx = propagation.TraceContext{}.Extract(ctx, propagation.HeaderCarrier(extra.Header))
+		}
+		if !hasHTTPHeaders || !trace.SpanContextFromContext(ctx).IsValid() {
+			// tools/list permits omitted params, represented by a typed nil.
+			var meta map[string]any
+			switch params := req.GetParams().(type) {
+			case *mcp.CallToolParamsRaw:
+				if params != nil {
+					meta = params.GetMeta()
+				}
+			case *mcp.ListToolsParams:
+				if params != nil {
+					meta = params.GetMeta()
+				}
+			}
+			if parent, ok := meta["traceparent"].(string); ok {
+				state, _ := meta["tracestate"].(string)
+				ctx = propagation.TraceContext{}.Extract(ctx, propagation.MapCarrier{"traceparent": parent, "tracestate": state})
+			}
+		}
+		ctx, span := otel.Tracer("github.com/aakarim/go-openlore/mcp").Start(ctx, method, trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+		if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok && params != nil {
+			name := params.Name
+			if name != "lore_bash" && name != "list_commands" {
+				name = "unknown"
+			}
+			span.SetAttributes(attribute.String("gen_ai.operation.name", "execute_tool"), attribute.String("gen_ai.tool.name", name))
+		}
+		result, err := next(ctx, method, req)
+		if err != nil {
+			// Protocol errors can echo arguments. Record classification only.
+			span.SetStatus(codes.Error, "MCP request failed")
+		} else if toolResult, ok := result.(*mcp.CallToolResult); ok {
+			if code, ok := exitCodeFromStructured(toolResult.StructuredContent); ok {
+				span.SetAttributes(attribute.Int("openlore.exit_code", code))
+				if code != 0 {
+					span.SetStatus(codes.Error, "shell command failed")
+				}
+			}
+			if toolResult.IsError {
+				span.SetStatus(codes.Error, "tool execution failed")
+			}
+		}
+		return result, err
+	}
 }
 
 type mcpShellInput struct {
@@ -155,20 +220,56 @@ func newMCPShellHandler(fs vfs.FileSystem, envVars map[string]string, factory fu
 			}
 		}
 
-		var stdout, stderr bytes.Buffer
-		exitCode := sh.ExecPipeline(input.Command, &stdout, &stderr, nil)
-
-		result := stdout.String()
-		if stderr.Len() > 0 {
-			result += "\n" + stderr.String()
-		}
-		if exitCode != 0 {
-			result += fmt.Sprintf("\nexit code: %d", exitCode)
-		}
+		output, stdout, stderr, exitCode := execShellTranscript(ctx, sh, input.Command)
 
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: result}},
+			Content:           []mcp.Content{&mcp.TextContent{Text: output}},
+			StructuredContent: map[string]any{"output": output, "stdout": stdout, "stderr": stderr, "exit_code": exitCode},
 		}, nil, nil
+	}
+}
+
+// execShellTranscript executes command in sh and returns its output streams
+// separately, along with a merged output value for backwards compatibility.
+// The exit code remains result data and is never added to either stream.
+func execShellTranscript(ctx context.Context, sh *shell.Shell, command string) (output, stdout, stderr string, exitCode int) {
+	var stdoutBuffer, stderrBuffer bytes.Buffer
+	exitCode = sh.ExecPipelineContext(ctx, command, &stdoutBuffer, &stderrBuffer, nil)
+
+	sections := make([]string, 0, 2)
+	if stdoutBuffer.Len() > 0 {
+		sections = append(sections, stdoutBuffer.String())
+	}
+	if stderrBuffer.Len() > 0 {
+		sections = append(sections, stderrBuffer.String())
+	}
+	return strings.Join(sections, "\n"), stdoutBuffer.String(), stderrBuffer.String(), exitCode
+}
+
+// exitCodeFromStructured extracts the exit_code field the shell tool places in
+// StructuredContent. The value has been through JSON on the way back to the
+// client, so its concrete Go type depends on the decoder: float64 today,
+// json.Number or an integer type if the SDK changes how it decodes.
+func exitCodeFromStructured(structured any) (int, bool) {
+	m, ok := structured.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	switch v := m["exit_code"].(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
 	}
 }
 

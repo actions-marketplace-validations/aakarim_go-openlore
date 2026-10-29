@@ -1,0 +1,857 @@
+package openlore
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"mime"
+	"net/http"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/aakarim/go-openlore/internal/analytics"
+	"github.com/aakarim/go-openlore/internal/passkeys"
+	"github.com/aakarim/go-openlore/pkg/rules"
+	"github.com/aakarim/go-openlore/pkg/vfs"
+)
+
+// CapabilityAccessView exposes policy explanations, never additional content
+// or mutation rights. Operators grant it to their own administrative roles.
+const CapabilityAccessView = "lore:access:view"
+
+const dashboardMaxBytes = 64 << 20
+
+// dashboardIdentity deliberately does not inherit the shell's optional-auth
+// posture. A supplied bad Authorization header cannot fall back to a cookie.
+func (s *Server) dashboardIdentity(r *http.Request) (Identity, bool) {
+	if !s.authEnforced {
+		return Identity{}, false
+	}
+	var id Identity
+	var ok bool
+	if r.Header.Get("Authorization") != "" {
+		if s.issuer == nil || s.identityStore == nil || bearerToken(r) == "" {
+			return Identity{}, false
+		}
+		claims, err := s.issuer.Verify(bearerToken(r))
+		if err != nil {
+			return Identity{}, false
+		}
+		id, err = s.identityStore.Resolve(r.Context(), claims)
+		ok = err == nil
+	} else if s.passkeys != nil {
+		if session, valid := s.passkeys.Session(r); valid {
+			id, ok = s.identityForName(session.Identity)
+		}
+	}
+	if !ok && r.Header.Get("Authorization") == "" {
+		// Only trusted in-process middleware can populate this private key.
+		id, ok = r.Context().Value(identityCtxKey{}).(Identity)
+	}
+	if !ok || id.IdentityName == "" || id.IdentityName == "guest" {
+		return Identity{}, false
+	}
+	policy, err := s.currentPolicy(id)
+	if err != nil {
+		return Identity{}, false
+	}
+	id.policySnapshot = &policy
+	return id, true
+}
+
+func (s *Server) dashboardAuth(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Vary", "Cookie, Authorization")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// The shell is public, so a next step names config keys only,
+		// never file contents or paths.
+		if !s.authEnforced {
+			_, nextSteps := s.dashboardSignInBlocker()
+			dashboardErrorJSON(w, http.StatusNotFound, map[string]any{"error": "dashboard requires configured authentication", "next_steps": nextSteps})
+			return
+		}
+		id, ok := s.dashboardIdentity(r)
+		if !ok {
+			if s.passkeys == nil {
+				// A bearer token still works, but a browser has no way to sign
+				// in, so do not send it to a login page that does not exist.
+				_, nextSteps := s.dashboardSignInBlocker()
+				dashboardErrorJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required", "next_steps": nextSteps})
+				return
+			}
+			dashboardErrorJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required", "login_url": "/passkey/login"})
+			return
+		}
+		next(w, r.WithContext(contextWithIdentity(r.Context(), id)))
+	})
+}
+
+func (s *Server) dashboardLorePath() string {
+	root := strings.Trim(s.config.Passkeys.LorePath, "/")
+	if root == "" {
+		return "/lore"
+	}
+	return "/" + root
+}
+
+// Dashboard data endpoints are independent of the optional built frontend.
+// A plain Go build continues to expose the existing backend and lore browser.
+// warnIfDashboardMissing reports at startup that this binary was built without
+// the dashboard frontend, so /dashboard/ will return 404.
+func (s *Server) warnIfDashboardMissing(frontend fs.FS) {
+	if frontend != nil {
+		return
+	}
+	s.logger.Warn("dashboard assets are not embedded in this binary; /dashboard/ will return 404",
+		"http_port", s.config.HTTPPort,
+		"fix", "use a release binary, Homebrew, or container, or build with `make distribution`")
+}
+
+func (s *Server) dashboardRoutes(frontend fs.FS) HTTPRouteRegistrar {
+	return func(mux *http.ServeMux) {
+		for route, handler := range map[string]http.HandlerFunc{
+			"session": s.dashboardSession, "tree": s.dashboardTree,
+			"files":   s.dashboardFiles,
+			"context": s.dashboardContext, "file": s.dashboardFile,
+			"raw": s.dashboardRaw, "history": s.dashboardHistory,
+			"access": s.dashboardAccess, "usage": s.dashboardUsage,
+			"analytics-status": s.dashboardAnalyticsStatus,
+			"setup":            s.dashboardSetup,
+			"sources":          s.dashboardSources,
+		} {
+			mux.Handle("GET /dashboard/api/"+route, s.dashboardAuth(handler))
+		}
+		// Do not let a SPA fallback turn unknown API routes/methods into HTML.
+		mux.HandleFunc("/dashboard/api/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				dashboardError(w, http.StatusMethodNotAllowed, "dashboard is read-only")
+				return
+			}
+			dashboardError(w, http.StatusNotFound, "not found")
+		})
+		if frontend != nil {
+			mux.Handle("GET /dashboard/{$}", s.dashboardShell(frontend))
+			mux.Handle("GET /dashboard/assets/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(frontend))))
+		}
+	}
+}
+
+func (s *Server) dashboardLoreHandler(frontend fs.FS) http.Handler {
+	shell := s.dashboardShell(frontend)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if passkeys.ServePWAAsset(w, r, s.dashboardLorePath()) {
+			return
+		}
+		if r.URL.Query().Get("raw") == "1" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				dashboardError(w, http.StatusMethodNotAllowed, "dashboard is read-only")
+				return
+			}
+			request := r.Clone(r.Context())
+			query := request.URL.Query()
+			query.Set("path", strings.TrimPrefix(r.URL.Path, s.dashboardLorePath()))
+			request.URL.RawQuery = query.Encode()
+			s.dashboardAuth(s.dashboardRaw).ServeHTTP(w, request)
+			return
+		}
+		shell.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) dashboardShell(frontend fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		index, err := fs.ReadFile(frontend, "index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		index = bytes.Replace(index, []byte("</head>"), []byte(passkeys.PWAHead(s.dashboardLorePath())+"</head>"), 1)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		_, _ = w.Write(index)
+	})
+}
+
+func dashboardJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func dashboardError(w http.ResponseWriter, status int, message string) {
+	dashboardErrorJSON(w, status, map[string]any{"error": message})
+}
+
+func dashboardErrorJSON(w http.ResponseWriter, status int, body map[string]any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	dashboardJSON(w, body)
+}
+
+func (s *Server) dashboardSession(w http.ResponseWriter, r *http.Request) {
+	id := s.identityFromContext(r.Context())
+	dashboardJSON(w, map[string]any{"identity": id.IdentityName, "lore_path": s.dashboardLorePath(), "access": s.hasCurrentCapability(id, CapabilityAccessView), "sources": true})
+}
+
+// Browser sessions get exactly the same filtered, read-only source view as
+// bearer clients, without depending on the optional shell API being enabled.
+func (s *Server) dashboardSources(w http.ResponseWriter, r *http.Request) {
+	r = r.Clone(r.Context())
+	u := *r.URL
+	r.URL = &u
+	const prefix = "/dashboard/api/sources/"
+	r.URL.Path = prefix + r.URL.Query().Get("store")
+	if r.URL.Query().Get("history") == "true" {
+		r.URL.Path += "/snapshots"
+	}
+	s.docstoreHandler(prefix).ServeHTTP(w, r)
+}
+
+func (s *Server) dashboardPath(r *http.Request) (Identity, vfs.FileSystem, string) {
+	id := s.identityFromContext(r.Context())
+	return id, s.buildCanonicalSessionFS(id), s.canonicalPath(r.URL.Query().Get("path"))
+}
+
+type dashboardNode struct {
+	Path       string                    `json:"path"`
+	Name       string                    `json:"name"`
+	Directory  bool                      `json:"directory"`
+	Icon       string                    `json:"icon,omitempty"`
+	Bytes      int64                     `json:"bytes"`
+	Lines      int64                     `json:"lines"`
+	Characters int64                     `json:"characters"`
+	Tokens     int64                     `json:"tokens"`
+	Children   []*dashboardNode          `json:"children,omitempty"`
+	Analytics  *analytics.SnapshotStatus `json:"analytics,omitempty"`
+}
+
+// authConfigVisible reports whether the session's filesystem exposes the live
+// lore.json at its synthetic /opt path, which the Setup view lists instead of
+// the knowledge tree.
+func authConfigVisible(scoped vfs.FileSystem) bool {
+	info, err := scoped.Stat(authConfigVFSPath)
+	return err == nil && !info.Dir
+}
+
+// dashboardKnowledgePath reports whether p belongs in the knowledge tree and
+// finder. Configuration (`.lore/` folders and the synthetic /opt config view)
+// is listed by the Setup view instead so the tree shows content only.
+func dashboardKnowledgePath(p string, authConfig bool) bool {
+	if hasReservedPath(p) {
+		return false
+	}
+	return !authConfig || !pathWithinRoot("/opt", p)
+}
+
+func (s *Server) dashboardTree(w http.ResponseWriter, r *http.Request) {
+	_, scoped, target := s.dashboardPath(r)
+	entries, err := scoped.ReadDir(target)
+	if err != nil {
+		dashboardError(w, http.StatusNotFound, "folder unavailable")
+		return
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Dir != entries[j].Dir {
+			return entries[i].Dir
+		}
+		return entries[i].Name() < entries[j].Name()
+	})
+	authConfig := authConfigVisible(scoped)
+	nodes := make([]dashboardNode, 0, len(entries))
+	for _, entry := range entries {
+		entryPath := path.Join(target, entry.Name())
+		if !dashboardKnowledgePath(entryPath, authConfig) {
+			continue
+		}
+		node := dashboardNode{Path: entryPath, Name: entry.Name(), Directory: entry.Dir, Bytes: entry.Size()}
+		if entry.Dir {
+			// Read only this folder's config, through the caller's scoped FS.
+			// Missing, inaccessible, oversized or invalid metadata leaves the default icon.
+			if content, err := readFileBounded(scoped, path.Join(node.Path, ".lore/config.yaml"), dashboardMaxBytes); err == nil {
+				if config, err := rules.DecodeFile(content); err == nil {
+					node.Icon = rules.FolderIcon(config.Icon)
+				}
+			}
+		}
+		nodes = append(nodes, node)
+	}
+	dashboardJSON(w, map[string]any{"path": target, "entries": nodes})
+}
+
+// dashboardMaxFiles bounds the flat listing the fuzzy finder downloads. The
+// response says when it stopped early so the UI never presents a partial
+// workspace as complete.
+const dashboardMaxFiles = 10000
+
+var errDashboardFilesFull = errors.New("file listing limit reached")
+
+type dashboardFile struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+}
+
+// dashboardFiles lists every readable file below the requested scope as a flat
+// list for client-side fuzzy finding. The scope is the per-docset seam: a
+// future docset filter resolves to that docset's roots and walks each of them
+// the same way, so neither the response shape nor the client has to change.
+func (s *Server) dashboardFiles(w http.ResponseWriter, r *http.Request) {
+	_, scoped, target := s.dashboardPath(r)
+	info, err := scoped.Stat(target)
+	if err != nil || !info.Dir {
+		dashboardError(w, http.StatusNotFound, "folder unavailable")
+		return
+	}
+	authConfig := authConfigVisible(scoped)
+	files := make([]dashboardFile, 0)
+	walkErr := vfs.WalkDir(scoped, target, func(p string, info *vfs.FileInfo, err error) error {
+		if ctxErr := r.Context().Err(); ctxErr != nil {
+			return ctxErr
+		}
+		// An unreadable or vanished subtree is omitted; the rest of the
+		// workspace stays searchable.
+		if err != nil || info.Dir || !dashboardKnowledgePath(p, authConfig) {
+			return nil
+		}
+		if len(files) >= dashboardMaxFiles {
+			return errDashboardFilesFull
+		}
+		files = append(files, dashboardFile{Path: p, Name: path.Base(p)})
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, errDashboardFilesFull) {
+		dashboardError(w, http.StatusNotFound, "folder unavailable")
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	dashboardJSON(w, map[string]any{"path": target, "entries": files, "truncated": errors.Is(walkErr, errDashboardFilesFull)})
+}
+
+var errDashboardSize = errors.New("context is too large; select a narrower folder")
+
+// Limit response complexity and individual file reads rather than silently
+// displaying a partial corpus as an exact total. The lazy tree remains
+// available when a scope has too many nodes or is too deeply nested.
+func (s *Server) dashboardContextNode(ctx context.Context, scoped vfs.FileSystem, target string, depth int, nodes *int) (*dashboardNode, error) {
+	info, err := scoped.Stat(target)
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", target, err)
+	}
+	return s.dashboardContextNodeFromInfo(ctx, scoped, target, info, depth, nodes)
+}
+
+func (s *Server) dashboardContextNodeFromInfo(ctx context.Context, scoped vfs.FileSystem, target string, info *vfs.FileInfo, depth int, nodes *int) (*dashboardNode, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	*nodes++
+	if *nodes > 10000 || depth > 64 {
+		return nil, errDashboardSize
+	}
+	node := &dashboardNode{Path: target, Name: path.Base(target), Directory: info.Dir}
+	if !info.Dir {
+		if info.Size() > dashboardMaxBytes {
+			// ReadDir metadata may be stale. Revalidate before rejecting an
+			// oversized child so a file removed during the walk is handled as a
+			// vanished descendant rather than an oversized live one.
+			current, err := scoped.Stat(target)
+			if err != nil {
+				return nil, fmt.Errorf("stat %s: %w", target, err)
+			}
+			if current.Dir {
+				return nil, fmt.Errorf("stat %s: changed type: %w", target, fs.ErrNotExist)
+			}
+			if current.Size() > dashboardMaxBytes {
+				return nil, errDashboardSize
+			}
+		}
+		if s.analytics != nil && s.analytics.HasFactsIndex() {
+			facts, err := s.analytics.CurrentFacts(ctx, target, info, func() ([]byte, error) {
+				if target == authConfigVFSPath || target == serverConfigVFSPath {
+					// The authorized config view deliberately overrides a durable
+					// file at the same path, so its displayed bytes take precedence.
+					return readFileBounded(scoped, target, dashboardMaxBytes)
+				}
+				content, err := readFileBounded(s.merge, target, dashboardMaxBytes)
+				if errors.Is(err, fs.ErrNotExist) {
+					// Future session wrappers may expose other synthetic files.
+					return readFileBounded(scoped, target, dashboardMaxBytes)
+				}
+				return content, err
+			})
+			if err != nil {
+				if errors.Is(err, errFileTooLarge) {
+					return nil, errDashboardSize
+				}
+				return nil, fmt.Errorf("read %s: %w", target, err)
+			}
+			node.Bytes, node.Lines = int64(facts.Scalars["bytes"]), int64(facts.Scalars["lines"])
+			node.Characters, node.Tokens = int64(facts.Scalars["characters"]), int64(facts.Scalars["tokens"])
+			return node, nil
+		}
+		content, err := readFileBounded(scoped, target, dashboardMaxBytes)
+		if err != nil {
+			if errors.Is(err, errFileTooLarge) {
+				return nil, errDashboardSize
+			}
+			return nil, fmt.Errorf("read %s: %w", target, err)
+		}
+		compute := analytics.ComputeScalars
+		if s.analytics != nil {
+			compute = s.analytics.ComputeScalars
+		}
+		facts := compute(target, content)
+		node.Bytes, node.Lines, node.Tokens = int64(len(content)), int64(facts.Scalars["lines"]), int64(facts.Scalars["tokens"])
+		node.Characters = int64(utf8.RuneCount(content))
+		return node, nil
+	}
+	entries, err := scoped.ReadDir(target)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", target, err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for i := range entries {
+		entry := &entries[i]
+		childTarget := path.Join(target, entry.Name())
+		previousNodes := *nodes
+		child, err := s.dashboardContextNodeFromInfo(ctx, scoped, childTarget, entry, depth+1, nodes)
+		if err != nil {
+			// A workspace-wide walk spans many files and can race a concurrent
+			// removal. The vanished child is no longer part of the live context;
+			// keep computing the remaining readable snapshot. Errors at the
+			// selected target and all non-not-found errors still fail the request.
+			if errors.Is(err, fs.ErrNotExist) {
+				*nodes = previousNodes
+				continue
+			}
+			return nil, err
+		}
+		node.Children = append(node.Children, child)
+		node.Bytes += child.Bytes
+		node.Lines += child.Lines
+		node.Characters += child.Characters
+		node.Tokens += child.Tokens
+	}
+	return node, nil
+}
+
+func (s *Server) dashboardContext(w http.ResponseWriter, r *http.Request) {
+	id, scoped, target := s.dashboardPath(r)
+	info, err := scoped.Stat(target)
+	if err != nil {
+		dashboardError(w, http.StatusNotFound, "context unavailable")
+		return
+	}
+	if s.analytics == nil || !s.analytics.HasFactsIndex() || !s.analytics.Started() {
+		// Keep the dashboard usable for embedders that deliberately supply the
+		// legacy file store. Normal server construction always uses SQLite and
+		// never takes this synchronous compatibility path.
+		nodes := 0
+		node, err := s.dashboardContextNode(r.Context(), scoped, target, 0, &nodes)
+		if errors.Is(err, errDashboardSize) {
+			dashboardError(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if err != nil {
+			dashboardError(w, http.StatusNotFound, "context unavailable")
+			return
+		}
+		dashboardJSON(w, node)
+		return
+	}
+	owners, filteredOwners, omitted := s.dashboardReadableFactOwners(id, target)
+	viewKey := "context:v1:" + s.analyticsPolicyKey(id) + ":" + target
+	rows, totals, status, err := s.analytics.AuthorizedIndexedFacts(r.Context(), viewKey, target, owners, filteredOwners, 10001, func(p string) bool {
+		_, err := scoped.Stat(p)
+		return err == nil
+	})
+	if err != nil {
+		dashboardError(w, http.StatusServiceUnavailable, "indexed context unavailable")
+		return
+	}
+	if len(rows) > 10000 {
+		dashboardError(w, http.StatusRequestEntityTooLarge, errDashboardSize.Error())
+		return
+	}
+	// Polling observes active/failed work. Completed facts are maintained by
+	// committed-write updates; age alone must not start a workspace rescan.
+	if s.analytics.ProcessingEnabled() && !status.Updating && status.State == "cold" {
+		s.analytics.PromoteFacts(target)
+		status.Updating = true
+	}
+	node := &dashboardNode{Path: target, Name: path.Base(target), Directory: info.Dir, Analytics: &status}
+	byPath := map[string]*dashboardNode{target: node}
+	for _, row := range rows {
+		file := &dashboardNode{Path: row.Path, Name: path.Base(row.Path)}
+		for _, values := range row.Sources {
+			file.Bytes += int64(values["bytes"])
+			file.Lines += int64(values["lines"])
+			file.Characters += int64(values["characters"])
+			file.Tokens += int64(values["tokens"])
+		}
+		if row.Path == target {
+			node.Bytes, node.Lines, node.Characters, node.Tokens = file.Bytes, file.Lines, file.Characters, file.Tokens
+			continue
+		}
+		parentPath := path.Dir(row.Path)
+		var lineage []string
+		for current := parentPath; current != target && pathWithinRoot(target, current); current = path.Dir(current) {
+			lineage = append(lineage, current)
+		}
+		parent := node
+		for i := len(lineage) - 1; i >= 0; i-- {
+			current := lineage[i]
+			dir := byPath[current]
+			if dir == nil {
+				dir = &dashboardNode{Path: current, Name: path.Base(current), Directory: true}
+				byPath[current] = dir
+				parent.Children = append(parent.Children, dir)
+			}
+			parent = dir
+		}
+		parent.Children = append(parent.Children, file)
+		for current := parent; current != nil; {
+			current.Bytes += file.Bytes
+			current.Lines += file.Lines
+			current.Characters += file.Characters
+			current.Tokens += file.Tokens
+			if current.Path == target {
+				break
+			}
+			current = byPath[path.Dir(current.Path)]
+		}
+	}
+	if info.Dir {
+		// The root summary comes from the durable owner-separated directory
+		// view. File rows remain solely for the bounded drill-down tree.
+		node.Bytes, node.Lines, node.Characters, node.Tokens = totals.Bytes, totals.Lines, totals.Characters, totals.Tokens
+	}
+	if omitted {
+		node.Analytics.Complete = false
+		node.Analytics.Coverage = "readable indexed content only; restricted docsets omitted"
+	}
+	var sortTree func(*dashboardNode)
+	sortTree = func(current *dashboardNode) {
+		sort.Slice(current.Children, func(i, j int) bool { return current.Children[i].Path < current.Children[j].Path })
+		for _, child := range current.Children {
+			sortTree(child)
+		}
+	}
+	sortTree(node)
+	dashboardJSON(w, node)
+}
+
+func (s *Server) dashboardReadableFactOwners(id Identity, target string) ([]string, []string, bool) {
+	full := map[string]struct{}{}
+	filtered := map[string]struct{}{}
+	omitted := false
+	source := &dashboardEventSource{server: s, identity: id}
+	for name, docset := range s.currentAuth().Docsets {
+		relevant := false
+		allReadable := true
+		pathGrant := false
+		for _, mapping := range docset.Paths {
+			root := displayPath(mapping)
+			if !pathWithinRoot(target, root) && !pathWithinRoot(root, target) {
+				continue
+			}
+			relevant = true
+			if source.wholeDocsetGrant(root) {
+			} else {
+				allReadable = false
+				_, grants, granted := s.grantsForPath(id, root)
+				pathGrant = pathGrant || granted && len(grants) > 0
+			}
+		}
+		if !relevant {
+			continue
+		}
+		if allReadable {
+			full[name] = struct{}{}
+		} else if pathGrant {
+			filtered[name] = struct{}{}
+		} else {
+			// Path-sensitive grants cannot prove an entire owner's totals. Omit
+			// them fail-closed rather than disclosing unrestricted metadata.
+			omitted = true
+		}
+	}
+	owners := make([]string, 0, len(full))
+	for owner := range full {
+		owners = append(owners, owner)
+	}
+	sort.Strings(owners)
+	filteredList := make([]string, 0, len(filtered))
+	for owner := range filtered {
+		filteredList = append(filteredList, owner)
+	}
+	sort.Strings(filteredList)
+	return owners, filteredList, omitted
+}
+
+func dashboardReadFile(scoped vfs.FileSystem, target string) ([]byte, error) {
+	info, err := scoped.Stat(target)
+	if err != nil || info.Dir {
+		return nil, fs.ErrNotExist
+	}
+	if info.Size() > dashboardMaxBytes {
+		return nil, errDashboardSize
+	}
+	content, err := readFileBounded(scoped, target, dashboardMaxBytes)
+	if errors.Is(err, errFileTooLarge) {
+		return nil, errDashboardSize
+	}
+	return content, err
+}
+
+func (s *Server) dashboardFile(w http.ResponseWriter, r *http.Request) {
+	_, scoped, target := s.dashboardPath(r)
+	content, err := dashboardReadFile(scoped, target)
+	if err != nil {
+		status := http.StatusNotFound
+		if errors.Is(err, errDashboardSize) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		dashboardError(w, status, "file unavailable or exceeds the 64 MiB viewer limit")
+		return
+	}
+	compute := analytics.ComputeScalars
+	if s.analytics != nil {
+		compute = s.analytics.ComputeScalars
+	}
+	facts := compute(target, content).Scalars
+	facts["characters"] = float64(utf8.RuneCount(content))
+	binary := !utf8.Valid(content) || bytes.IndexByte(content, 0) >= 0
+	result := map[string]any{"path": target, "name": path.Base(target), "binary": binary, "facts": facts, "content_type": http.DetectContentType(content)}
+	if !binary {
+		result["source"] = string(content)
+		if ext := strings.ToLower(path.Ext(target)); ext == ".md" || ext == ".markdown" {
+			fragment, err := passkeys.RenderMarkdownFragment(content)
+			if err != nil {
+				dashboardError(w, http.StatusInternalServerError, "markdown preview unavailable")
+				return
+			}
+			result["html"] = fragment
+		}
+	}
+	dashboardJSON(w, result)
+}
+
+// Raw responses cannot execute same-origin user HTML/SVG/scripts. Raster images
+// may be embedded by the Markdown renderer; every other format is a download.
+func (s *Server) dashboardRaw(w http.ResponseWriter, r *http.Request) {
+	_, scoped, target := s.dashboardPath(r)
+	content, err := dashboardReadFile(scoped, target)
+	if err != nil {
+		dashboardError(w, http.StatusNotFound, "file unavailable")
+		return
+	}
+	contentType := http.DetectContentType(content)
+	switch contentType {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		w.Header().Set("Content-Type", contentType)
+	default:
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": path.Base(target)}))
+	}
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	_, _ = w.Write(content)
+}
+
+func (s *Server) dashboardHistory(w http.ResponseWriter, r *http.Request) {
+	id, scoped, target := s.dashboardPath(r)
+	info, err := scoped.Stat(target)
+	if err != nil || info.Dir {
+		dashboardError(w, http.StatusNotFound, "file unavailable")
+		return
+	}
+	entries := make([]passkeys.FileHistoryEntry, 0)
+	result := map[string]any{"available": s.history != nil, "entries": entries}
+	if s.history != nil {
+		page, err := s.history.Query(r.Context(), HistoryQuery{FileKey: target, Roots: historyRoots(s.sessionDocsets(id)), Limit: 100, Cursor: r.URL.Query().Get("cursor")})
+		if err != nil {
+			dashboardError(w, http.StatusServiceUnavailable, "timeline unavailable")
+			return
+		}
+		for _, record := range page.Records {
+			entries = append(entries, passkeys.FileHistoryEntry{Time: record.Time, Attribution: record.Attribution.String(), Action: record.Action, Hash: record.ContentHash})
+		}
+		result["entries"], result["next_cursor"] = entries, page.NextCursor
+	}
+	dashboardJSON(w, result)
+}
+
+func (s *Server) dashboardUsage(w http.ResponseWriter, r *http.Request) {
+	id, scoped, target := s.dashboardPath(r)
+	if _, err := scoped.Stat(target); err != nil {
+		dashboardError(w, http.StatusNotFound, "scope unavailable")
+		return
+	}
+	if s.analytics == nil {
+		dashboardError(w, http.StatusServiceUnavailable, "analytics is disabled")
+		return
+	}
+	days, ratio := 30, 4
+	var err error
+	if raw := r.URL.Query().Get("days"); raw != "" {
+		days, err = strconv.Atoi(raw)
+	}
+	if err != nil || days < 1 || days > 365 {
+		dashboardError(w, http.StatusBadRequest, "days must be between 1 and 365")
+		return
+	}
+	if raw := r.URL.Query().Get("ratio"); raw != "" {
+		ratio, err = strconv.Atoi(raw)
+	}
+	if err != nil || (ratio != 4 && ratio != 6) {
+		dashboardError(w, http.StatusBadRequest, "ratio must be 4 or 6 characters per token")
+		return
+	}
+	if !s.analytics.HasDurableViews() {
+		now := time.Now().UTC()
+		params := analytics.Params{Since: now.Add(-time.Duration(days) * 24 * time.Hour), Until: now, Extra: map[string]string{"path": target}}
+		summary, err := analytics.UsageSummary(r.Context(), s.DashboardEventSource(id, target), params, ratio)
+		if err != nil {
+			dashboardError(w, http.StatusServiceUnavailable, "usage unavailable")
+			return
+		}
+		dashboardJSON(w, summary)
+		return
+	}
+	key := fmt.Sprintf("v2:%s:%s:%d", s.analyticsPolicyKey(id), target, ratio)
+	summary, err := s.analytics.DashboardUsage(r.Context(), key, time.Duration(days)*24*time.Hour, s.DashboardEventSource(id, target), ratio)
+	if err != nil {
+		dashboardError(w, http.StatusServiceUnavailable, "usage unavailable")
+		return
+	}
+	dashboardJSON(w, summary)
+}
+
+// dashboardAnalyticsStatus reports instance processing progress without event
+// contents, counts by scope, or paths, so any dashboard reader may see it.
+func (s *Server) dashboardAnalyticsStatus(w http.ResponseWriter, r *http.Request) {
+	if s.analytics == nil {
+		dashboardError(w, http.StatusServiceUnavailable, "analytics is disabled")
+		return
+	}
+	dashboardJSON(w, struct {
+		Activity analytics.ActivityStatus `json:"activity"`
+	}{Activity: s.analytics.ActivityStatus(r.Context())})
+}
+
+// analyticsPolicyKey identifies the caller's effective policy and the docset
+// configuration, so cached analytics are never shared across policies. It
+// hashes values rather than their Go representation: %#v prints nested
+// pointers as addresses, which changed the key on every restart.
+func (s *Server) analyticsPolicyKey(id Identity) string {
+	value, err := json.Marshal(struct {
+		Policy  *AuthorizationPolicy
+		Docsets any
+	}{id.policySnapshot, s.currentAuth().Docsets})
+	if err != nil {
+		// Unreachable for configuration decoded from JSON or YAML; stay
+		// unique per policy rather than risk sharing views.
+		value = fmt.Appendf(nil, "%#v|%#v", id.policySnapshot, s.currentAuth().Docsets)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(value))
+}
+
+type dashboardRole struct {
+	Role   string `json:"role"`
+	Grant  string `json:"grant"`
+	Denied bool   `json:"denied"`
+}
+
+type dashboardDocset struct {
+	Name     string          `json:"name"`
+	Roots    []string        `json:"roots"`
+	Roles    []dashboardRole `json:"roles"`
+	Readonly bool            `json:"readonly"`
+}
+
+type dashboardRuleLayer struct {
+	Origin string                    `json:"origin"`
+	Scope  string                    `json:"scope"`
+	Rules  map[string]rules.RuleSpec `json:"rules"`
+}
+
+func (s *Server) dashboardAccess(w http.ResponseWriter, r *http.Request) {
+	id := s.identityFromContext(r.Context())
+	if !s.hasCurrentCapability(id, CapabilityAccessView) {
+		dashboardError(w, http.StatusNotFound, "not found")
+		return
+	}
+	_, scoped, target := s.dashboardPath(r)
+	info, err := scoped.Stat(target)
+	if err != nil {
+		dashboardError(w, http.StatusNotFound, "scope unavailable")
+		return
+	}
+	governing, _, _ := s.mostSpecificDocset(target)
+	docsets := make([]dashboardDocset, 0)
+	for name, ds := range s.currentAuth().Docsets {
+		grants, allowed := s.effectiveGrantNames(id, name)
+		if !allowed {
+			continue
+		}
+		item := dashboardDocset{Name: name, Roots: []string{}, Roles: []dashboardRole{}, Readonly: s.config.Readonly || (ds.Readonly != nil && *ds.Readonly)}
+		for _, mapping := range ds.Paths {
+			root := displayPath(mapping)
+			if !pathWithinRoot(target, root) && !(name == governing && pathWithinRoot(root, target)) {
+				continue
+			}
+			for _, grantName := range grants {
+				if grant, ok := s.grants.get(grantName); ok && grant.CanRead(ds, root) {
+					item.Roots = append(item.Roots, root)
+					break
+				}
+			}
+		}
+		if len(item.Roots) == 0 {
+			continue
+		}
+		item.Roles = dashboardRoles(ds.Access.Allow, ds.Access.Deny)
+		sort.Strings(item.Roots)
+		docsets = append(docsets, item)
+	}
+	sort.Slice(docsets, func(i, j int) bool { return docsets[i].Name < docsets[j].Name })
+	layers := make([]dashboardRuleLayer, 0)
+	notes := []string{"Roles are configured by the operator. Denials override grants; delegated restrictions and token scopes may further narrow access.", "Folder rules are validation settings, not access control. This dashboard cannot change either."}
+	if governing != "" {
+		dir := target
+		if !info.Dir {
+			dir = path.Dir(target)
+		}
+		configLayers := &configRuleLayers{global: s.currentAuth().Rules, docsets: s.currentAuth().Docsets}
+		base, baseErr := configLayers.LayersFor(r.Context(), path.Join(dir, "__dashboard_rules__.md"))
+		folder, folderErr := newFolderRuleLayers(scoped, s.currentAuth().Docsets).LayersForDir(r.Context(), dir)
+		if baseErr != nil || folderErr != nil {
+			notes = append(notes, "Some rule layers are unavailable; no complete effective-policy claim is made.")
+		}
+		for _, layer := range append(base, folder...) {
+			layers = append(layers, dashboardRuleLayer{Origin: layer.Origin, Scope: layer.Scope, Rules: layer.Rules})
+		}
+		if _, err := rules.Unify(append(base, folder...)); err != nil {
+			notes = append(notes, fmt.Sprintf("Rule layers conflict; check the configured rules (%T).", err))
+		}
+	}
+	dashboardJSON(w, map[string]any{"path": target, "docsets": docsets, "folder_rules": layers, "notes": notes})
+}

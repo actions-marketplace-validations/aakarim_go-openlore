@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/aakarim/go-openlore/pkg/rules"
 	"github.com/aakarim/go-openlore/pkg/vfs"
 )
 
@@ -161,6 +162,9 @@ func writeResultMsg(errW io.Writer, cmdName, p string, err error) int {
 	if err == nil {
 		return 0
 	}
+	if writeRuleRejection(errW, err) {
+		return 1
+	}
 	var pce *vfs.PendingChangeError
 	if errors.As(err, &pce) {
 		// Not a failure: a middleware parked the write as a pending change.
@@ -172,10 +176,15 @@ func writeResultMsg(errW io.Writer, cmdName, p string, err error) int {
 		fmt.Fprintf(errW, "%s: %s: file changed concurrently — re-read and retry\n", cmdName, p)
 		return 1
 	}
-	if errors.Is(err, vfs.ErrReadOnly) {
-		fmt.Fprintf(errW, "%s: %s: read-only filesystem\n", cmdName, p)
-	} else {
-		fmt.Fprintf(errW, "%s: %s: %s\n", cmdName, p, err)
-	}
+	fmt.Fprintf(errW, "%s: %s: %s\n", cmdName, p, err)
 	return 1
+}
+
+func writeRuleRejection(errW io.Writer, err error) bool {
+	var rejection *rules.Rejection
+	if !errors.As(err, &rejection) {
+		return false
+	}
+	fmt.Fprintln(errW, err)
+	return true
 }

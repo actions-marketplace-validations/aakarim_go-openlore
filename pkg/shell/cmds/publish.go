@@ -40,8 +40,25 @@ func CmdPublish(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdi
 			fmt.Fprintf(w, "  /%s/\n", t.Name)
 		}
 		fmt.Fprintln(w)
-		fmt.Fprintln(w, "Example: echo '# Title' | publish /knowledge/topic.md")
+		fmt.Fprintf(w, "Example: echo '# Title' | publish /%s/topic.md\n", writable[0].Name)
 		return 0
+	}
+
+	// publish takes exactly one path. Reject extra arguments rather than
+	// ignoring them, and turn the `publish <docset> <file>` form into the path
+	// the caller meant.
+	if len(args) > 1 {
+		quoted := make([]string, len(args))
+		for i, a := range args {
+			quoted[i] = fmt.Sprintf("%q", a)
+		}
+		fmt.Fprintf(errW, "publish: expected one path /<docset>/<file>; got %d arguments %s\n", len(args), strings.Join(quoted, " "))
+		if len(args) == 2 && !strings.Contains(strings.Trim(args[0], "/"), "/") {
+			fmt.Fprintf(errW, "  e.g. publish %s\n", path.Join("/", args[0], args[1]))
+		} else {
+			fmt.Fprintf(errW, "  e.g. publish /%s/my-file.md\n", writable[0].Name)
+		}
+		return 1
 	}
 
 	// Parse /<docset>/<file...>.
@@ -93,6 +110,9 @@ func CmdPublish(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdi
 	}
 
 	if _, err := WriteFile(ctx, dest, data, false); err != nil {
+		if writeRuleRejection(errW, err) {
+			return 1
+		}
 		var pchg *vfs.PendingChangeError
 		if errors.As(err, &pchg) {
 			// Not a failure: a middleware parked the publish as a pending change.
@@ -105,7 +125,7 @@ func CmdPublish(ctx CmdContext, args []string, w io.Writer, errW io.Writer, stdi
 			return 1
 		}
 		if errors.Is(err, vfs.ErrReadOnly) {
-			fmt.Fprintf(errW, "publish: no access to %s\n", dest)
+			fmt.Fprintf(errW, "publish: no access to %s: %s\n", dest, err)
 		} else {
 			fmt.Fprintf(errW, "publish: %s\n", err)
 		}

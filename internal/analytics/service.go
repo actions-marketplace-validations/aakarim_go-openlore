@@ -1,0 +1,1313 @@
+package analytics
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
+	"net/http"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	"github.com/aakarim/go-openlore/internal/config"
+	"github.com/aakarim/go-openlore/pkg/vfs"
+)
+
+type Deps struct {
+	FS         vfs.FileSystem
+	Processors []Processor
+	Tokenizer  Tokenizer
+	Remote     RemoteEventStore
+	Store      AggregationStore
+}
+type Health struct {
+	Dropped                 int64     `json:"dropped"`
+	DroppedAtShutdown       int64     `json:"dropped_at_shutdown"`
+	PipelineEnabled         bool      `json:"pipeline_enabled"`
+	PipelineLagEvents       int64     `json:"pipeline_lag_events"`
+	ShipLagBytes            int64     `json:"ship_lag_bytes"`
+	Segments                int       `json:"segments"`
+	LastRefresh             time.Time `json:"last_refresh,omitempty"`
+	HistoryCursorPosition   string    `json:"history_cursor_position,omitempty"`
+	HistoryCursorLagBytes   int64     `json:"history_cursor_lag_bytes,omitempty"`
+	HistoryBlobStoreObjects int64     `json:"history_blob_store_objects,omitempty"`
+	HistoryBlobStoreBytes   int64     `json:"history_blob_store_bytes,omitempty"`
+}
+type Service struct {
+	cfg         config.AnalyticsConfig
+	fs          vfs.FileSystem
+	log         EventLog
+	recorder    *Recorder
+	pipeline    *Pipeline
+	shipper     *Shipper
+	refresher   *Refresher
+	store       AggregationStore
+	index       FactsIndex
+	eventIndex  *sqliteEventIndex
+	indexer     *factsIndexer
+	processor   *workProcessor
+	facts       ContentFacts
+	registry    *Registry
+	aggregator  *Aggregator
+	remote      RemoteEventStore
+	history     func(context.Context) (position string, lagBytes, blobObjects, blobBytes int64)
+	emitted     sync.Map
+	providersMu sync.RWMutex
+	providers   []ContentScalarProvider
+	scopesMu    sync.RWMutex
+	scopes      []KnowledgeScope
+	indexLog    sync.Once
+	cancel      context.CancelFunc
+	close       sync.Once
+	started     atomic.Bool
+	closeErr    error
+	expensive   chan struct{}
+}
+
+type KnowledgeScope struct {
+	Name string
+	Root string
+	// Exclude contains internal-storage subtrees, not knowledge documents.
+	// It participates in the durable scan fingerprint so older facts and
+	// pending work cannot survive a change to the content boundary.
+	Exclude []string `json:",omitempty"`
+	// ContentBoundary identifies visibility policy outside analytics itself.
+	// A change starts a new generation instead of resuming incompatible work.
+	ContentBoundary string `json:",omitempty"`
+}
+
+type SnapshotStatus struct {
+	State      string            `json:"state"`
+	ComputedAt time.Time         `json:"computed_at,omitempty"`
+	Updating   bool              `json:"updating"`
+	Complete   bool              `json:"complete"`
+	Coverage   string            `json:"coverage,omitempty"`
+	Error      string            `json:"error,omitempty"`
+	Warning    string            `json:"warning,omitempty"`
+	Progress   *SnapshotProgress `json:"progress,omitempty"`
+	// RetryAt is when a failed view without a previous result will next be
+	// rebuilt. Clients poll again then so transient failures recover.
+	RetryAt time.Time `json:"retry_at,omitzero"`
+}
+
+// Totals are not known during discovery/replay. Report real work done rather
+// than a percentage that can move backwards as more work is discovered.
+type SnapshotProgress struct {
+	Phase     string `json:"phase"`
+	Processed int64  `json:"processed"`
+	Unit      string `json:"unit"`
+	// Since is the oldest time from which history has been fully processed.
+	Since time.Time `json:"since,omitzero"`
+}
+
+type UsageSnapshot struct {
+	Summary
+	Analytics SnapshotStatus `json:"analytics"`
+}
+
+func New(cfg config.AnalyticsConfig, deps Deps) (*Service, error) {
+	dir := cfg.Dir
+	if dir == "" {
+		dir = "analytics"
+	}
+	cfg.Dir = dir
+	log, err := OpenEventLog(filepath.Join(dir, "events"), LogOptions{Rotate: cfg.Log.Rotate, Compress: cfg.Log.Compress, Retention: cfg.Log.Retention})
+	if err != nil {
+		return nil, err
+	}
+	store := deps.Store
+	if store == nil {
+		switch strings.ToLower(strings.TrimSpace(cfg.Aggregations.Store)) {
+		case "file":
+			store, err = OpenFileAggregationStore(filepath.Join(dir, "aggregations"))
+		case "", "sqlite":
+			store, err = OpenSQLiteAggregationStore(filepath.Join(dir, "aggregations.sqlite"))
+		default:
+			err = fmt.Errorf("unsupported analytics aggregation store %q", cfg.Aggregations.Store)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	remote := deps.Remote
+	if remote == nil {
+		switch strings.ToLower(strings.TrimSpace(cfg.Ship.Remote)) {
+		case "", "none":
+		default:
+			err = fmt.Errorf("unsupported analytics remote store %q", cfg.Ship.Remote)
+		}
+		if err != nil {
+			_ = store.Close()
+			_ = log.Close()
+			return nil, err
+		}
+	}
+	providers := append([]ContentScalarProvider(nil), defaultProviders...)
+	if deps.Tokenizer != nil {
+		providers = []ContentScalarProvider{sizeProvider{}, tokenProvider{deps.Tokenizer}}
+	}
+	var index FactsIndex
+	if sqliteStore, ok := store.(*SQLiteAggregationStore); ok {
+		index = newSQLiteFactsIndex(sqliteStore)
+	}
+	expensive := make(chan struct{}, 1)
+	s := &Service{cfg: cfg, fs: deps.FS, log: log, store: store, index: index, providers: providers, processor: newWorkProcessor(expensive), expensive: expensive}
+	if sqliteStore, ok := store.(*SQLiteAggregationStore); ok {
+		s.eventIndex = &sqliteEventIndex{db: sqliteStore.db, done: make(chan struct{})}
+	}
+	s.facts = newIndexedContentFacts(deps.FS, deps.FS, index, &s.indexLog, providers, s.excludedContent)
+	if index != nil && deps.FS != nil {
+		s.indexer = newFactsIndexer(s)
+	}
+	for _, processor := range deps.Processors {
+		if processor != nil && processor.Name() == "doc-scalars" {
+			s.emitted.Store("doc.scalars", true)
+		}
+	}
+	reg := NewRegistry(store, func() []string {
+		events := []string{"session.start", "session.end", "command.exec", "command.unknown", "syntax.unknown", "auth.login", "doc.write", "search.query", "doc.read", "doc.hit"}
+		s.emitted.Range(func(event, _ any) bool { events = append(events, event.(string)); return true })
+		if s.pipeline != nil {
+			events = append(events, s.pipeline.EventTypes()...)
+		}
+		return events
+	})
+	reg.Bind(log, s.facts)
+	for _, a := range BuiltinAggregations() {
+		if err := reg.Register(a); err != nil {
+			return nil, err
+		}
+	}
+	agg := NewAggregator(AggregatorOptions{})
+	ref := NewRefresher(reg, log, store, cfg.Aggregations.RefreshInterval)
+	rec := NewRecorder(log, cfg.Pipeline.Buffer)
+	rec.SetLiveConsumer(agg)
+	s.recorder = rec
+	s.shipper = NewShipper(log, remote, cfg.Ship.Interval)
+	s.remote = remote
+	s.registry = reg
+	s.aggregator = agg
+	s.refresher = ref
+	ref.SetScheduler(func(run func(context.Context)) { s.processor.enqueue("refresh", false, run) })
+	if cfg.PipelineEnabled() {
+		derivedSink := sinkFunc(func(ctx context.Context, event Event) {
+			if err := log.Append(ctx, event); err == nil {
+				// Derived scalar gauges may reconstruct present state during
+				// catch-up; source counters remain live-only via Recorder.
+				agg.Consume(ctx, event)
+			}
+		})
+		s.pipeline = NewPipeline(log, filepath.Join(dir, "pipeline.checkpoint"), PipelineOptions{Processors: deps.Processors, Refresher: ref, Sink: derivedSink, Buffer: cfg.Pipeline.Buffer, Gate: expensive})
+		rec.SetHandoff(s.pipeline.Handoff())
+	} else {
+		reg.SetPaused(true)
+	}
+	agg.SetHealth(s.Health)
+	return s, nil
+}
+func (s *Service) Start(ctx context.Context) {
+	s.started.Store(true)
+	ctx, s.cancel = context.WithCancel(ctx)
+	go s.processor.run(ctx)
+	if s.indexer != nil {
+		if err := s.indexer.start(s.cfg.PipelineEnabled()); err != nil {
+			s.indexLog.Do(func() { log.Printf("analytics facts scan could not start: %v", err) })
+		}
+	}
+	s.recorder.Start(ctx)
+	if s.pipeline != nil {
+		s.pipeline.Run(ctx)
+		s.refresher.Run(ctx)
+	}
+	if s.eventIndex != nil && s.cfg.PipelineEnabled() {
+		go s.eventIndex.run(ctx, s.log, filepath.Join(s.cfg.Dir, "event-index.checkpoint"), s.processor)
+	}
+	go s.shipper.Run(ctx)
+}
+func (s *Service) Sink() Sink { return s.recorder }
+func (s *Service) AddProcessor(processor Processor) {
+	if s.pipeline != nil && processor != nil {
+		s.pipeline.AddProcessor(processor)
+		if processor.Name() == "doc-scalars" {
+			s.emitted.Store("doc.scalars", true)
+		}
+	}
+}
+func (s *Service) AddConsumer(consumer Consumer) {
+	if s.pipeline != nil && consumer != nil {
+		s.pipeline.AddConsumer(consumer)
+	}
+}
+func (s *Service) AddContentScalarProvider(provider ContentScalarProvider) {
+	if provider == nil {
+		return
+	}
+	s.providersMu.Lock()
+	s.providers = append(s.providers, provider)
+	s.facts = newIndexedContentFacts(s.fs, s.fs, s.index, &s.indexLog, s.providers, s.excludedContent)
+	s.registry.Bind(s.log, s.facts)
+	s.providersMu.Unlock()
+	s.reconfigureFacts()
+}
+func (s *Service) SetTokenizer(tokenizer Tokenizer) {
+	if tokenizer == nil {
+		return
+	}
+	s.providersMu.Lock()
+	providers := make([]ContentScalarProvider, 0, len(s.providers))
+	for _, provider := range s.providers {
+		if _, builtin := provider.(tokenProvider); !builtin {
+			providers = append(providers, provider)
+		}
+	}
+	s.providers = append(providers, tokenProvider{tokenizer})
+	s.facts = newIndexedContentFacts(s.fs, s.fs, s.index, &s.indexLog, s.providers, s.excludedContent)
+	s.registry.Bind(s.log, s.facts)
+	s.providersMu.Unlock()
+	s.reconfigureFacts()
+}
+
+// reconfigureFacts starts a new generation only when the scan contract changes.
+func (s *Service) reconfigureFacts() {
+	if s.indexer == nil {
+		return
+	}
+	if err := s.indexer.reconfigure(s.cfg.PipelineEnabled()); err != nil {
+		s.indexLog.Do(func() { log.Printf("analytics facts scan could not start: %v", err) })
+	}
+}
+
+func (s *Service) EnqueueFacts(p string) {
+	if s.indexer != nil && s.cfg.PipelineEnabled() && !s.excludedContent(p) {
+		s.indexer.enqueue(p)
+	}
+}
+
+func (s *Service) PromoteFacts(p string) {
+	if s.indexer == nil || !s.cfg.PipelineEnabled() || s.excludedContent(p) {
+		return
+	}
+	s.indexer.enqueue(p)
+	s.processor.enqueue("facts", true, s.indexer.run)
+}
+
+func (s *Service) ProcessingEnabled() bool { return s.cfg.PipelineEnabled() }
+func (s *Service) Started() bool           { return s.started.Load() }
+func (s *Service) HasDurableViews() bool   { return s.eventIndex != nil }
+func (s *Service) IndexedEventSource() EventSource {
+	if s.eventIndex != nil {
+		return s.eventIndex
+	}
+	return s.log
+}
+
+func (s *Service) SetKnowledgeScopes(scopes []KnowledgeScope) {
+	clean := make([]KnowledgeScope, 0, len(scopes))
+	for _, scope := range scopes {
+		if scope.Name != "" {
+			scope.Root = vfs.CleanPath(scope.Root)
+			scope.Exclude = append([]string(nil), scope.Exclude...)
+			for i := range scope.Exclude {
+				scope.Exclude[i] = vfs.CleanPath(scope.Exclude[i])
+			}
+			sort.Strings(scope.Exclude)
+			clean = append(clean, scope)
+		}
+	}
+	s.scopesMu.Lock()
+	s.scopes = clean
+	s.scopesMu.Unlock()
+	if s.indexer != nil {
+		var err error
+		if s.cfg.PipelineEnabled() {
+			err = s.indexer.setScopes(clean)
+		} else {
+			err = s.indexer.stageScopes(clean)
+		}
+		if err != nil {
+			s.indexLog.Do(func() { log.Printf("analytics facts scan could not start: %v", err) })
+		}
+	}
+}
+
+func (s *Service) excludedContent(p string) bool {
+	p = vfs.CleanPath(p)
+	s.scopesMu.RLock()
+	defer s.scopesMu.RUnlock()
+	for _, scope := range s.scopes {
+		for _, root := range scope.Exclude {
+			if pathWithinPrefix(p, root) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Service) ownerForPath(p string) string {
+	p = vfs.CleanPath(p)
+	s.scopesMu.RLock()
+	defer s.scopesMu.RUnlock()
+	owner, longest := "", -1
+	for _, scope := range s.scopes {
+		if pathWithinPrefix(p, scope.Root) && len(scope.Root) > longest {
+			owner, longest = scope.Name, len(scope.Root)
+		}
+	}
+	return owner
+}
+
+func (s *Service) IndexedFacts(ctx context.Context, prefix string, limit int) ([]IndexedFacts, SnapshotStatus, error) {
+	if s.index == nil {
+		return nil, SnapshotStatus{State: "unavailable", Error: "durable facts require sqlite storage"}, nil
+	}
+	rows, err := s.index.PrefixScan(ctx, prefix, limit)
+	if err != nil {
+		return nil, SnapshotStatus{State: "failed", Error: err.Error()}, err
+	}
+	state, stateErr := s.index.ScanState(ctx)
+	if stateErr != nil {
+		return nil, SnapshotStatus{State: "failed", Error: stateErr.Error()}, stateErr
+	}
+	status := SnapshotStatus{State: state.State, Complete: state.State == "ready", ComputedAt: state.CompletedAt, Error: state.Error, Coverage: "indexed content docsets only"}
+	// Incremental updates to a ready generation (individual writes) apply
+	// within one processor turn; only a full scan is reported as updating.
+	status.Updating = state.State == "updating"
+	if state.Generation == 0 {
+		status.State, status.Complete, status.Updating = "cold", false, false
+	} else if state.State == "failed" {
+		status.Complete, status.Updating = false, false
+		status.Coverage = "last attempted content scan failed; indexed rows may be partial"
+	} else if state.State == "updating" {
+		status.Complete = false
+		status.Coverage = "content scan in progress; indexed rows are partial"
+		status.Progress = &SnapshotProgress{Phase: "content", Processed: state.Processed, Unit: "paths"}
+	}
+	if state.Skipped > 0 {
+		status.Warning = fmt.Sprintf("Files over 64 MiB omitted from workspace knowledge totals: %d.", state.Skipped)
+	}
+	if state.Generation > 0 && !state.ScopeCompatible {
+		status.Complete = false
+		status.Coverage = "content scope changed; prior facts are incompatible and hidden"
+		compatibleRows := rows[:0]
+		for _, row := range rows {
+			if row.Generation == state.Generation {
+				compatibleRows = append(compatibleRows, row)
+			}
+		}
+		rows = compatibleRows
+	}
+	if !s.cfg.PipelineEnabled() {
+		status.State, status.Updating = "disabled", false
+		status.Progress = nil
+	}
+	return rows, status, nil
+}
+
+type DirectoryFacts struct {
+	Files                            int64
+	Bytes, Lines, Characters, Tokens int64
+}
+
+func (s *Service) IndexedFactsForOwners(ctx context.Context, prefix string, owners []string, limit int) ([]IndexedFacts, DirectoryFacts, SnapshotStatus, error) {
+	_, status, err := s.IndexedFacts(ctx, prefix, 1)
+	if err != nil {
+		return nil, DirectoryFacts{}, status, err
+	}
+	state, err := s.index.ScanState(ctx)
+	if err != nil {
+		return nil, DirectoryFacts{}, SnapshotStatus{State: "failed", Error: err.Error()}, err
+	}
+	if !state.ScopeCompatible {
+		return nil, DirectoryFacts{}, status, nil
+	}
+	rows, err := s.index.PrefixScanOwners(ctx, prefix, owners, limit)
+	if err != nil {
+		status.State, status.Complete, status.Error = "failed", false, err.Error()
+		return nil, DirectoryFacts{}, status, err
+	}
+	totals, computed, err := s.index.DirectoryTotals(ctx, prefix, owners)
+	if err != nil {
+		status.State, status.Complete, status.Error = "failed", false, err.Error()
+		return nil, DirectoryFacts{}, status, err
+	}
+	if status.ComputedAt.IsZero() {
+		status.ComputedAt = computed
+	}
+	return rows, DirectoryFacts{Files: totals.files, Bytes: int64(totals.bytes), Lines: int64(totals.lines), Characters: int64(totals.characters), Tokens: int64(totals.tokens)}, status, nil
+}
+
+func (s *Service) AuthorizedIndexedFacts(ctx context.Context, key, prefix string, fullOwners, filteredOwners []string, limit int, readable func(string) bool) ([]IndexedFacts, DirectoryFacts, SnapshotStatus, error) {
+	rows, totals, status, err := s.IndexedFactsForOwners(ctx, prefix, fullOwners, limit)
+	if err != nil || len(filteredOwners) == 0 {
+		return rows, totals, status, err
+	}
+	if status.State == "disabled" {
+		status.Complete, status.Updating = false, false
+		status.Coverage = "analytics processing disabled; path-sensitive filtering is paused"
+		return rows, totals, status, nil
+	}
+	scanState, err := s.index.ScanState(ctx)
+	if err != nil {
+		return nil, DirectoryFacts{}, status, err
+	}
+	if !scanState.ScopeCompatible {
+		// Neither previously filtered paths nor new filter work may bypass
+		// the scope compatibility boundary used by whole-docset views.
+		status.Complete = false
+		return nil, DirectoryFacts{}, status, nil
+	}
+	store, ok := s.store.(*SQLiteAggregationStore)
+	if !ok {
+		status.Complete = false
+		status.Coverage = "path-sensitive grants omitted without sqlite filtering"
+		return rows, totals, status, nil
+	}
+	var generation int64
+	var cursor, filterState, filterError string
+	currentGeneration := scanState.Generation
+	err = store.db.QueryRowContext(ctx, `SELECT generation,cursor,state,error FROM dashboard_fact_state WHERE key=?`, key).Scan(&generation, &cursor, &filterState, &filterError)
+	if errors.Is(err, sql.ErrNoRows) || generation != currentGeneration {
+		generation = currentGeneration
+		tx, txErr := store.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return nil, DirectoryFacts{}, status, txErr
+		}
+		defer tx.Rollback()
+		if _, txErr = tx.ExecContext(ctx, `DELETE FROM dashboard_fact_paths WHERE key=?`, key); txErr == nil {
+			_, txErr = tx.ExecContext(ctx, `INSERT INTO dashboard_fact_state(key,generation,cursor,state,computed_at,error) VALUES(?,?,'','updating',0,'') ON CONFLICT(key) DO UPDATE SET generation=excluded.generation,cursor='',state='updating',computed_at=0,error=''`, key, generation)
+		}
+		if txErr != nil {
+			return nil, DirectoryFacts{}, status, txErr
+		}
+		if err = tx.Commit(); err != nil {
+			return nil, DirectoryFacts{}, status, err
+		}
+		cursor, filterState, filterError = "", "updating", ""
+	} else if err != nil {
+		return nil, DirectoryFacts{}, status, err
+	}
+	var allowedPaths []string
+	remainingLimit := limit - len(rows)
+	if remainingLimit < 0 {
+		remainingLimit = 0
+	}
+	pathRows, err := store.db.QueryContext(ctx, `SELECT path FROM dashboard_fact_paths WHERE key=? ORDER BY path LIMIT ?`, key, remainingLimit)
+	if err != nil {
+		return nil, DirectoryFacts{}, status, err
+	}
+	for pathRows.Next() {
+		var p string
+		if err := pathRows.Scan(&p); err != nil {
+			pathRows.Close()
+			return nil, DirectoryFacts{}, status, err
+		}
+		allowedPaths = append(allowedPaths, p)
+	}
+	if err := pathRows.Close(); err != nil {
+		return nil, DirectoryFacts{}, status, err
+	}
+	filtered, err := s.index.FactsForPaths(ctx, allowedPaths)
+	if err != nil {
+		return nil, DirectoryFacts{}, status, err
+	}
+	rows = append(rows, filtered...)
+	for _, fact := range filtered {
+		factTotals := totalsForFact(fact)
+		totals.Files++
+		totals.Bytes += int64(factTotals.bytes)
+		totals.Lines += int64(factTotals.lines)
+		totals.Characters += int64(factTotals.characters)
+		totals.Tokens += int64(factTotals.tokens)
+	}
+	if status.Complete && filterState != "ready" {
+		jobKey := "facts-filter:" + key
+		var run func(context.Context)
+		run = func(jobCtx context.Context) {
+			var jobCursor string
+			if err := store.db.QueryRowContext(jobCtx, `SELECT cursor FROM dashboard_fact_state WHERE key=? AND generation=?`, key, generation).Scan(&jobCursor); err != nil {
+				return
+			}
+			batch, scanErr := s.index.PrefixScanOwnersAfter(jobCtx, prefix, filteredOwners, jobCursor, factsBatchSize)
+			if scanErr != nil {
+				_, _ = store.db.ExecContext(context.WithoutCancel(jobCtx), `UPDATE dashboard_fact_state SET state='failed',error=? WHERE key=? AND generation=?`, scanErr.Error(), key, generation)
+				return
+			}
+			tx, txErr := store.db.BeginTx(jobCtx, nil)
+			if txErr != nil {
+				return
+			}
+			defer tx.Rollback()
+			for _, fact := range batch {
+				if readable(fact.Path) {
+					if _, txErr = tx.ExecContext(jobCtx, `INSERT OR IGNORE INTO dashboard_fact_paths(key,path) VALUES(?,?)`, key, fact.Path); txErr != nil {
+						return
+					}
+				}
+				jobCursor = fact.Path
+			}
+			nextState := "updating"
+			if len(batch) < factsBatchSize {
+				nextState = "ready"
+			}
+			if _, txErr = tx.ExecContext(jobCtx, `UPDATE dashboard_fact_state SET cursor=?,state=?,computed_at=?,error='' WHERE key=? AND generation=?`, jobCursor, nextState, time.Now().UTC().UnixNano(), key, generation); txErr != nil {
+				return
+			}
+			if txErr = tx.Commit(); txErr == nil && nextState != "ready" {
+				s.processor.enqueueFollowup(jobKey, false, run)
+			}
+		}
+		s.processor.enqueue(jobKey, true, run)
+	}
+	if filterState != "ready" {
+		status.Complete = false
+		status.Updating = filterState == "updating"
+		status.Coverage = "fully readable docsets plus committed path-filtered coverage; filtering continues"
+	}
+	if filterError != "" {
+		status.Error = filterError
+		status.Coverage = "path-sensitive coverage failed; fully readable docsets remain available"
+	}
+	return rows, totals, status, nil
+}
+
+// dashboardRetryInterval spaces retries of a view whose build failed without
+// a previous result, so polling clients do not trigger a rebuild every second.
+const dashboardRetryInterval = time.Minute
+
+// failedViewSQL records a build failure. Without a saved result, computed_at
+// is the latest failure time and restarts the retry backoff; with one, it
+// keeps describing when that result was computed.
+const failedViewSQL = `INSERT INTO dashboard_views(key,computed_at,error) VALUES(?,?,?)
+ON CONFLICT(key) DO UPDATE SET error=excluded.error,
+computed_at=CASE WHEN dashboard_views.value IS NULL THEN excluded.computed_at ELSE dashboard_views.computed_at END`
+
+func retryBackoff(found bool, lastError string, failedAt int64) bool {
+	return !found && lastError != "" && time.Since(time.Unix(0, failedAt)) < dashboardRetryInterval
+}
+
+func retryAt(failedAt int64) time.Time {
+	return time.Unix(0, failedAt).Add(dashboardRetryInterval).UTC()
+}
+
+func (s *Service) historyProgress() *SnapshotProgress {
+	return &SnapshotProgress{Phase: "history", Processed: s.eventIndex.processed.Load(), Unit: "events", Since: s.eventIndex.processedSince()}
+}
+
+// ActivityStatus describes how much retained event history the dashboard can
+// use. History is indexed newest first, so ProcessedSince moves backwards.
+type ActivityStatus struct {
+	State           string    `json:"state"`
+	Complete        bool      `json:"complete"`
+	ProcessedSince  time.Time `json:"processed_since,omitzero"`
+	LatestEvent     time.Time `json:"latest_event,omitzero"`
+	EventsProcessed int64     `json:"events_processed"`
+	Error           string    `json:"error,omitempty"`
+}
+
+func (s *Service) ActivityStatus(ctx context.Context) ActivityStatus {
+	if s.eventIndex == nil {
+		return ActivityStatus{State: "unavailable", Error: "durable activity requires sqlite storage"}
+	}
+	status := ActivityStatus{State: "updating", ProcessedSince: s.eventIndex.processedSince(), LatestEvent: s.eventIndex.latest(ctx), EventsProcessed: s.eventIndex.processed.Load()}
+	if s.eventIndex.caughtUp.Load() {
+		status.State, status.Complete = "ready", true
+	}
+	if message := s.eventIndex.lastError.Load(); message != nil {
+		status.State, status.Error = "failed", *message
+	}
+	if !s.cfg.PipelineEnabled() {
+		status.State = "disabled"
+	}
+	return status
+}
+
+// CorrelationMargin is how far beyond a requested range dashboard event
+// sources look for related events (for example a command's child reads) that
+// decide whether an event inside the range is visible.
+const CorrelationMargin = 10 * time.Minute
+
+// incrementalRefreshInterval is how old an incrementally built view may be
+// before a request refreshes it. Such refreshes only rescan the unsettled
+// edges of the window, so they are cheap.
+const incrementalRefreshInterval = time.Minute
+
+// dayTurnBudget bounds how long one processor turn spends building missing
+// days of a view before yielding the lane to other work.
+const dayTurnBudget = 5 * time.Second
+
+// dayRetention bounds the cached daily partials kept for dashboard views.
+// Windows longer than maxDayWindow are not built from daily partials: their
+// oldest days would be pruned between the turns that build them.
+const (
+	dayRetention = 366
+	maxDayWindow = (dayRetention - 1) * 24 * time.Hour
+)
+
+// aggregationRefreshInterval spaces full rebuilds of a materialized view
+// that is not incremental. A rebuild rescans the whole window, so longer
+// windows refresh less often.
+func aggregationRefreshInterval(window time.Duration) time.Duration {
+	return min(max(window/2880, time.Minute), 15*time.Minute)
+}
+
+// DashboardUsage serves only a committed complete summary. Missing or stale
+// work is deduplicated onto the same bounded processor used by fact warming.
+// key identifies the scope (policy, path and ratio) and is shared by every
+// window, so the daily partials behind a 7-day view also serve a 90-day one.
+// A view with a result reports updating only while it has none; refreshing a
+// published result happens in the background without blocking the client.
+func (s *Service) DashboardUsage(ctx context.Context, key string, window time.Duration, source EventSource, charsPerToken int) (UsageSnapshot, error) {
+	store, ok := s.store.(*SQLiteAggregationStore)
+	if !ok {
+		return UsageSnapshot{Analytics: SnapshotStatus{State: "unavailable", Error: "durable usage requires sqlite storage"}}, nil
+	}
+	viewKey := fmt.Sprintf("%s:%d", key, int64(window/time.Second))
+	var raw []byte
+	var computed int64
+	var lastError string
+	err := store.db.QueryRowContext(ctx, `SELECT value,computed_at,error FROM dashboard_views WHERE key=?`, viewKey).Scan(&raw, &computed, &lastError)
+	found := err == nil && len(raw) > 0
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return UsageSnapshot{}, err
+	}
+	result := UsageSnapshot{Analytics: SnapshotStatus{State: "cold", Complete: false}}
+	if found {
+		if err := json.Unmarshal(raw, &result.Summary); err != nil {
+			return UsageSnapshot{}, err
+		}
+		result.Analytics = SnapshotStatus{State: "ready", Complete: true, ComputedAt: time.Unix(0, computed).UTC(), Coverage: "complete requested time window"}
+	}
+	// Keep the JSON collection contract in cold/disabled/error states and
+	// when reading older materializations containing a null activity slice.
+	if result.Activity == nil {
+		result.Activity = []SummaryActivity{}
+	}
+	if !s.cfg.PipelineEnabled() {
+		result.Analytics.State, result.Analytics.Updating = "disabled", false
+		return result, nil
+	}
+	if s.eventIndex != nil && !s.eventIndex.covers(window) {
+		// A published result stays ready until the range can be rebuilt;
+		// only a cold view reports catch-up progress.
+		if !found {
+			result.Analytics.Updating = true
+			result.Analytics.Coverage = "durable event index is catching up"
+			result.Analytics.Progress = s.historyProgress()
+		}
+		if message := s.eventIndex.lastError.Load(); message != nil {
+			result.Analytics.Error = *message
+		}
+		return result, nil
+	}
+	stale := !found || time.Since(result.Analytics.ComputedAt) > incrementalRefreshInterval
+	days := usageDayPartials(store.db, key, source, charsPerToken)
+	if stale && !retryBackoff(found, lastError, computed) {
+		jobKey := "usage:" + viewKey
+		var run func(context.Context)
+		run = func(jobCtx context.Context) {
+			fail := func(err error) {
+				_, _ = store.db.ExecContext(context.WithoutCancel(jobCtx), failedViewSQL, viewKey, time.Now().UTC().UnixNano(), err.Error())
+			}
+			if s.eventIndex != nil {
+				// Refresh only new tails: an older unindexed segment must not
+				// delay a range that is already covered.
+				if err := s.eventIndex.refreshTails(jobCtx); err != nil {
+					fail(err)
+					return
+				}
+				// Older history may still be indexing; this range is ready
+				// once every event inside it has been indexed.
+				if !s.eventIndex.covers(window) {
+					return
+				}
+			}
+			now := time.Now().UTC()
+			partial, done, err := days.summarize(jobCtx, now.Add(-window), now, time.Now().Add(dayTurnBudget))
+			if err != nil {
+				fail(err)
+				return
+			}
+			if !done {
+				s.processor.enqueueFollowup(jobKey, !found, run)
+				return
+			}
+			summary := partial.(*usagePartial).summary()
+			encoded, err := json.Marshal(summary)
+			if err == nil {
+				_, _ = store.db.ExecContext(context.WithoutCancel(jobCtx), `INSERT INTO dashboard_views(key,value,computed_at,error) VALUES(?,?,?,'')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value,computed_at=excluded.computed_at,error=''`, viewKey, encoded, summary.ComputedAt.UnixNano())
+			}
+		}
+		// A missing view is what the client is waiting for; refreshing a
+		// published one is background work.
+		s.processor.enqueue(jobKey, !found, run)
+		if !found {
+			result.Analytics.Updating = true
+			if result.Analytics.Progress, err = days.progress(ctx, window); err != nil {
+				return UsageSnapshot{}, err
+			}
+		}
+	}
+	if lastError != "" {
+		result.Analytics.Error = lastError
+		if !found {
+			result.Analytics.State = "failed"
+			result.Analytics.RetryAt = retryAt(computed)
+		}
+	}
+	return result, nil
+}
+
+const dayNanos = int64(24 * time.Hour)
+
+func dayStart(day int64) time.Time { return time.Unix(0, day*dayNanos).UTC() }
+
+// settledDays returns the UTC days [first, last) that lie wholly inside
+// [since, until] and are settled: no event within CorrelationMargin of the
+// day can still be recorded in real time. Settled days are cached; the
+// ranges before first and from last onwards are always scanned.
+func settledDays(since, until time.Time) (first, last int64) {
+	first = (since.UnixNano() + dayNanos - 1) / dayNanos
+	last = until.Add(-CorrelationMargin).UnixNano() / dayNanos
+	return first, max(first, last)
+}
+
+// dayPartial is mergeable view state over a time range.
+type dayPartial interface {
+	// mergeLater adds the partial of a later, adjacent range. It reports
+	// false when the union cannot be merged exactly; the window is then
+	// scanned as a whole instead.
+	mergeLater(dayPartial) bool
+}
+
+func (u *usagePartial) mergeLater(later dayPartial) bool { return u.merge(later.(*usagePartial)) }
+
+// aggregationPartial adapts an aggregation's Partial to the day cache.
+type aggregationPartial struct{ Partial }
+
+func (a aggregationPartial) mergeLater(later dayPartial) bool {
+	a.Partial.Merge(later.(aggregationPartial).Partial)
+	return true
+}
+
+func (a aggregationPartial) MarshalJSON() ([]byte, error) { return json.Marshal(a.Partial) }
+
+// dayPartials caches the partials of settled UTC days for one view scope,
+// in dashboard_days under key, and merges them with fresh scans of the
+// unsettled edges of a window.
+type dayPartials struct {
+	db     *sql.DB
+	key    string
+	build  func(ctx context.Context, from, to time.Time) (dayPartial, error)
+	decode func([]byte) (dayPartial, error)
+}
+
+func usageDayPartials(db *sql.DB, key string, source EventSource, charsPerToken int) dayPartials {
+	return dayPartials{db: db, key: "usage:" + key,
+		build: func(ctx context.Context, from, to time.Time) (dayPartial, error) {
+			return scanUsage(ctx, source, from, to, charsPerToken)
+		},
+		decode: func(value []byte) (dayPartial, error) {
+			partial := newUsagePartial()
+			return partial, json.Unmarshal(value, partial)
+		},
+	}
+}
+
+func aggregationDayPartials(db *sql.DB, key string, source EventSource, inc *Incremental, p Params) dayPartials {
+	return dayPartials{db: db, key: "aggregation:" + key,
+		build: func(ctx context.Context, from, to time.Time) (dayPartial, error) {
+			partial := inc.New(p)
+			err := source.Scan(ctx, EventFilter{From: from, To: to, Types: inc.Types}, func(e Event) error {
+				partial.Add(e)
+				return nil
+			})
+			return aggregationPartial{partial}, err
+		},
+		decode: func(value []byte) (dayPartial, error) {
+			partial := inc.New(p)
+			return aggregationPartial{partial}, json.Unmarshal(value, partial)
+		},
+	}
+}
+
+// progress reports how many settled days of a cold view are cached.
+func (d dayPartials) progress(ctx context.Context, window time.Duration) (*SnapshotProgress, error) {
+	now := time.Now().UTC()
+	first, last := settledDays(now.Add(-window), now)
+	var days int64
+	if err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dashboard_days WHERE key=? AND day>=? AND day<?`, d.key, first, last).Scan(&days); err != nil || days == 0 {
+		return nil, err
+	}
+	return &SnapshotProgress{Phase: "activity", Processed: days, Unit: "days"}, nil
+}
+
+// summarize merges cached daily partials with fresh scans of the unsettled
+// edges of [since, until]. It builds missing days until deadline and reports
+// done=false when more turns are needed.
+func (d dayPartials) summarize(ctx context.Context, since, until time.Time, deadline time.Time) (dayPartial, bool, error) {
+	if err := d.invalidate(ctx); err != nil {
+		return nil, false, err
+	}
+	first, last := settledDays(since, until)
+	if _, err := d.db.ExecContext(ctx, `DELETE FROM dashboard_days WHERE day<?`, until.UnixNano()/dayNanos-dayRetention); err != nil {
+		return nil, false, err
+	}
+	days := map[int64]dayPartial{}
+	rows, err := d.db.QueryContext(ctx, `SELECT day,value FROM dashboard_days WHERE key=? AND day>=? AND day<?`, d.key, first, last)
+	if err != nil {
+		return nil, false, err
+	}
+	for rows.Next() {
+		var day int64
+		var value []byte
+		if err := rows.Scan(&day, &value); err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		partial, err := d.decode(value)
+		if err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		days[day] = partial
+	}
+	if err := rows.Close(); err != nil {
+		return nil, false, err
+	}
+	var maxRow sql.NullInt64
+	if err := d.db.QueryRowContext(ctx, `SELECT MAX(rowid) FROM analytics_events`).Scan(&maxRow); err != nil {
+		return nil, false, err
+	}
+	// Build the newest missing days first so recent ranges fill in early.
+	// Every turn builds at least one day so slow days still make progress.
+	built := 0
+	for day := last - 1; day >= first; day-- {
+		if days[day] != nil {
+			continue
+		}
+		if built > 0 && time.Now().After(deadline) {
+			return nil, false, nil
+		}
+		built++
+		partial, err := d.build(ctx, dayStart(day), dayStart(day+1).Add(-time.Nanosecond))
+		if err != nil {
+			return nil, false, err
+		}
+		encoded, err := json.Marshal(partial)
+		if err != nil {
+			return nil, false, err
+		}
+		// Every event indexed by now was visible to the scan, so only later
+		// rows can invalidate this day.
+		if _, err := d.db.ExecContext(ctx, `INSERT INTO dashboard_days(key,day,value,valid_rowid) VALUES(?,?,?,?)
+ON CONFLICT(key,day) DO UPDATE SET value=excluded.value,valid_rowid=excluded.valid_rowid`, d.key, day, encoded, maxRow.Int64); err != nil {
+			return nil, false, err
+		}
+		days[day] = partial
+	}
+	var partials []dayPartial
+	tailSince := since
+	if first < last {
+		if since.Before(dayStart(first)) {
+			edge, err := d.build(ctx, since, dayStart(first).Add(-time.Nanosecond))
+			if err != nil {
+				return nil, false, err
+			}
+			partials = append(partials, edge)
+		}
+		for day := first; day < last; day++ {
+			partials = append(partials, days[day])
+		}
+		tailSince = dayStart(last)
+	}
+	tail, err := d.build(ctx, tailSince, until)
+	if err != nil {
+		return nil, false, err
+	}
+	partials = append(partials, tail)
+	total := partials[0]
+	for _, partial := range partials[1:] {
+		if !total.mergeLater(partial) {
+			whole, err := d.build(ctx, since, until)
+			return whole, err == nil, err
+		}
+	}
+	return total, true, nil
+}
+
+// invalidate drops cached days that events indexed since they were built
+// could change, such as late or backfilled events, then records that the
+// remaining days are valid up to the newest indexed event. Events are never
+// deleted and re-indexing keeps an event's rowid, so rows above a day's
+// valid_rowid are exactly the events it has not seen.
+func (d dayPartials) invalidate(ctx context.Context) error {
+	var checked, maxRow sql.NullInt64
+	if err := d.db.QueryRowContext(ctx, `SELECT MIN(valid_rowid) FROM dashboard_days WHERE key=?`, d.key).Scan(&checked); err != nil || !checked.Valid {
+		return err
+	}
+	if err := d.db.QueryRowContext(ctx, `SELECT MAX(rowid) FROM analytics_events`).Scan(&maxRow); err != nil || maxRow.Int64 <= checked.Int64 {
+		return err
+	}
+	rows, err := d.db.QueryContext(ctx, `SELECT time_ns,rowid FROM analytics_events WHERE rowid>? AND rowid<=?`, checked.Int64, maxRow.Int64)
+	if err != nil {
+		return err
+	}
+	changed := map[int64]int64{}
+	for rows.Next() {
+		var timeNS, rowid int64
+		if err := rows.Scan(&timeNS, &rowid); err != nil {
+			rows.Close()
+			return err
+		}
+		margin := int64(CorrelationMargin)
+		for day := (timeNS - margin) / dayNanos; day <= (timeNS+margin)/dayNanos; day++ {
+			changed[day] = max(changed[day], rowid)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for day, rowid := range changed {
+		if _, err := d.db.ExecContext(ctx, `DELETE FROM dashboard_days WHERE key=? AND day=? AND valid_rowid<?`, d.key, day, rowid); err != nil {
+			return err
+		}
+	}
+	_, err = d.db.ExecContext(ctx, `UPDATE dashboard_days SET valid_rowid=? WHERE key=? AND valid_rowid<?`, maxRow.Int64, d.key, maxRow.Int64)
+	return err
+}
+
+// DashboardMaterialized serves the committed result of aggregation name for
+// the window p.Until-p.Since ending now, computed over source. scope
+// identifies the caller's policy, the aggregation and its Extra parameters;
+// incremental aggregations cache their daily partials under it, so every
+// window and limit of the same scope shares them.
+func (s *Service) DashboardMaterialized(ctx context.Context, scope, name string, p Params, source EventSource, facts ContentFacts) (Materialized, error) {
+	store, ok := s.store.(*SQLiteAggregationStore)
+	if !ok {
+		return Materialized{Status: StatusPaused, Note: "durable analytics require sqlite storage"}, nil
+	}
+	window := p.Until.Sub(p.Since)
+	key := fmt.Sprintf("aggregation:%s:%d:%d", scope, int64(window/time.Second), p.Limit)
+	var raw []byte
+	var computed int64
+	var lastError string
+	err := store.db.QueryRowContext(ctx, `SELECT value,computed_at,error FROM dashboard_views WHERE key=?`, key).Scan(&raw, &computed, &lastError)
+	found := err == nil && len(raw) > 0
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Materialized{}, err
+	}
+	result := Materialized{Status: StatusPlanned, Note: "Results appear when the first build finishes."}
+	if found {
+		if err := json.Unmarshal(raw, &result); err != nil {
+			return Materialized{}, err
+		}
+	}
+	state := &SnapshotStatus{State: "cold", Complete: false}
+	if found {
+		state = &SnapshotStatus{State: "ready", Complete: true, ComputedAt: time.Unix(0, computed).UTC(), Coverage: "complete requested time window"}
+	}
+	result.Analytics = state
+	if !s.cfg.PipelineEnabled() {
+		state.State = "disabled"
+		return result, nil
+	}
+	if s.eventIndex != nil && !s.eventIndex.covers(window) {
+		// A published result stays ready until the range can be rebuilt;
+		// only a cold view reports catch-up progress.
+		if !found {
+			state.State, state.Updating, state.Coverage = "updating", true, "durable event index is catching up"
+			state.Progress = s.historyProgress()
+		}
+		if message := s.eventIndex.lastError.Load(); message != nil {
+			state.Error = *message
+		}
+		return result, nil
+	}
+	inc := s.registry.incrementalFor(name)
+	if window > maxDayWindow {
+		inc = nil
+	}
+	refresh := aggregationRefreshInterval(window)
+	if inc != nil {
+		refresh = incrementalRefreshInterval
+	}
+	if (!found || time.Since(state.ComputedAt) > refresh) && !retryBackoff(found, lastError, computed) {
+		var run func(context.Context)
+		run = func(jobCtx context.Context) {
+			fail := func(err error) {
+				_, _ = store.db.ExecContext(context.WithoutCancel(jobCtx), failedViewSQL, key, time.Now().UTC().UnixNano(), err.Error())
+			}
+			if s.eventIndex != nil {
+				// Refresh only new tails: an older unindexed segment must not
+				// delay a range that is already covered.
+				if err := s.eventIndex.refreshTails(jobCtx); err != nil {
+					fail(err)
+					return
+				}
+				// Older history may still be indexing; this range is ready
+				// once every event inside it has been indexed.
+				if !s.eventIndex.covers(window) {
+					return
+				}
+			}
+			now := time.Now().UTC()
+			jobParams := p
+			jobParams.Since, jobParams.Until = now.Add(-window), now
+			var view Materialized
+			if inc == nil {
+				var err error
+				if view, err = s.registry.RunWithSource(jobCtx, name, jobParams, source, facts); err != nil {
+					fail(err)
+					return
+				}
+			} else {
+				if inc.Check != nil {
+					if err := inc.Check(jobCtx, facts, jobParams); err != nil {
+						fail(err)
+						return
+					}
+				}
+				partial, done, err := aggregationDayPartials(store.db, scope, source, inc, jobParams).summarize(jobCtx, jobParams.Since, now, time.Now().Add(dayTurnBudget))
+				if err != nil {
+					fail(err)
+					return
+				}
+				if !done {
+					s.processor.enqueueFollowup(key, !found, run)
+					return
+				}
+				table, err := inc.Table(jobCtx, partial.(aggregationPartial).Partial, facts, jobParams)
+				if err != nil {
+					fail(err)
+					return
+				}
+				view = Materialized{Status: StatusOK, Table: table, ComputedAt: time.Now().UTC(), Window: jobParams}
+			}
+			view.Analytics = nil
+			if encoded, err := json.Marshal(view); err == nil {
+				_, _ = store.db.ExecContext(context.WithoutCancel(jobCtx), `INSERT INTO dashboard_views(key,value,computed_at,error) VALUES(?,?,?,'') ON CONFLICT(key) DO UPDATE SET value=excluded.value,computed_at=excluded.computed_at,error=''`, key, encoded, view.ComputedAt.UnixNano())
+			}
+		}
+		// A missing view is what the client is waiting for; refreshing a
+		// published one is background work.
+		s.processor.enqueue(key, !found, run)
+		// A published result stays ready while it refreshes in the background.
+		state.Updating = !found
+		if !found && inc != nil {
+			if state.Progress, err = aggregationDayPartials(store.db, scope, source, inc, p).progress(ctx, window); err != nil {
+				return Materialized{}, err
+			}
+		}
+	}
+	if lastError != "" {
+		state.Error = lastError
+		if !found {
+			state.State, result.Note = "failed", "Analytics build failed"
+			state.RetryAt = retryAt(computed)
+		}
+	}
+	return result, nil
+}
+func (s *Service) RegisterAggregations(aggregations []Aggregation) error {
+	return s.registry.RegisterAll(aggregations)
+}
+func (s *Service) NewContentFacts(fs vfs.FileSystem) ContentFacts {
+	s.providersMu.RLock()
+	providers := append([]ContentScalarProvider(nil), s.providers...)
+	s.providersMu.RUnlock()
+	return newIndexedContentFacts(fs, s.fs, s.index, &s.indexLog, providers, s.excludedContent)
+}
+
+func (s *Service) HasFactsIndex() bool { return s.index != nil }
+
+func (s *Service) CurrentFacts(ctx context.Context, p string, info *vfs.FileInfo, read func() ([]byte, error)) (DocScalars, error) {
+	return s.currentFacts(ctx, p, info, read, 0)
+}
+
+func (s *Service) currentFacts(ctx context.Context, p string, info *vfs.FileInfo, read func() ([]byte, error), generation int64) (DocScalars, error) {
+	if s.excludedContent(p) {
+		return DocScalars{}, fs.ErrNotExist
+	}
+	s.providersMu.RLock()
+	providers := append([]ContentScalarProvider(nil), s.providers...)
+	s.providersMu.RUnlock()
+	if s.index != nil {
+		fact, hit, err := s.index.Lookup(ctx, p, info.Size(), info.ModTime().UnixNano(), sourceNames(providers))
+		if err == nil && hit {
+			owner := s.ownerForPath(p)
+			if fact.Owner != owner || generation != 0 && fact.Generation != generation {
+				fact.Owner = owner
+				if generation != 0 {
+					fact.Generation = generation
+				}
+				if err := s.index.Upsert(ctx, fact); err != nil {
+					return DocScalars{}, err
+				}
+			}
+			return docScalarsFromIndexed(fact, providers)
+		}
+		if err != nil {
+			s.indexLog.Do(func() { log.Printf("analytics facts index unavailable; computing uncached: %v", err) })
+		}
+	}
+	content, err := read()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) && s.index != nil {
+			_ = s.index.Delete(ctx, p)
+		}
+		return DocScalars{}, err
+	}
+	if s.index == nil {
+		doc := computeScalars(p, content, providers)
+		doc.Scalars["characters"] = float64(utf8.RuneCount(content))
+		return doc, nil
+	}
+	// Do not publish content under metadata observed before a concurrent write.
+	// The write hook (or periodic reconciliation) will retry this file.
+	if s.ownerForPath(p) != "" {
+		if current, statErr := s.fs.Stat(p); statErr == nil && (current.Size() != int64(len(content)) || current.ModTime().UnixNano() != info.ModTime().UnixNano()) {
+			s.EnqueueFacts(p)
+			return DocScalars{}, fmt.Errorf("%s changed during analytics indexing", p)
+		}
+	}
+	fact := indexedFacts(p, info, content, providers)
+	fact.Owner = s.ownerForPath(p)
+	fact.Generation = generation
+	if err := s.index.Upsert(ctx, fact); err != nil {
+		if generation != 0 {
+			return DocScalars{}, err
+		}
+		s.indexLog.Do(func() { log.Printf("analytics facts index unavailable; computing uncached: %v", err) })
+	}
+	return docScalarsFromIndexed(fact, providers)
+}
+func (s *Service) ComputeScalars(path string, content []byte) DocScalars {
+	s.providersMu.RLock()
+	providers := append([]ContentScalarProvider(nil), s.providers...)
+	s.providersMu.RUnlock()
+	return computeScalars(path, content, providers)
+}
+func (s *Service) Record(ctx context.Context, e Event) { s.recorder.Record(ctx, e) }
+func (s *Service) Registry() *Registry                 { return s.registry }
+func (s *Service) Facts() ContentFacts {
+	s.providersMu.RLock()
+	defer s.providersMu.RUnlock()
+	return s.facts
+}
+func (s *Service) EventSource() EventSource { return s.log }
+func (s *Service) Aggregator() http.Handler { return http.HandlerFunc(s.aggregator.ServeHTTP) }
+func (s *Service) Refresh(ctx context.Context, names ...string) error {
+	select {
+	case s.expensive <- struct{}{}:
+		defer func() { <-s.expensive }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.refresher.Refresh(ctx, names...)
+}
+func (s *Service) Replay(ctx context.Context, from time.Time) error {
+	if s.pipeline == nil {
+		return nil
+	}
+	return s.pipeline.Replay(ctx, from)
+}
+
+// RebuildFromRemote restores remote events into the local canonical log, then
+// uses the ordinary replay path to recreate metrics and materializations.
+func (s *Service) RebuildFromRemote(ctx context.Context) error {
+	if s.remote == nil {
+		return errors.New("analytics remote store is not configured")
+	}
+	source := RemoteSource(s.remote)
+	existing := map[string]struct{}{}
+	if err := s.log.Scan(ctx, EventFilter{}, func(event Event) error {
+		existing[event.ID] = struct{}{}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := source.Scan(ctx, EventFilter{}, func(event Event) error {
+		if _, found := existing[event.ID]; found {
+			return nil
+		}
+		existing[event.ID] = struct{}{}
+		return s.log.Append(ctx, event)
+	}); err != nil {
+		return err
+	}
+	if s.pipeline != nil {
+		if err := s.pipeline.Replay(ctx, time.Time{}); err != nil {
+			return err
+		}
+	}
+	for _, aggregation := range s.registry.List() {
+		if err := s.store.Invalidate(ctx, aggregation.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *Service) ShipNow(ctx context.Context) error { return s.shipper.ShipNow(ctx) }
+func (s *Service) SetHistoryHealth(provider func(context.Context) (string, int64, int64, int64)) {
+	s.history = provider
+}
+func (s *Service) Health() Health {
+	h := Health{Dropped: s.recorder.Dropped(), DroppedAtShutdown: s.recorder.DroppedAtShutdown(), PipelineEnabled: s.pipeline != nil, Segments: len(s.log.Segments()), LastRefresh: s.refresher.LastRefresh()}
+	if s.pipeline != nil {
+		h.PipelineLagEvents, _ = s.pipeline.Lag()
+	}
+	h.ShipLagBytes, _ = s.shipper.Lag()
+	if s.history != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		h.HistoryCursorPosition, h.HistoryCursorLagBytes, h.HistoryBlobStoreObjects, h.HistoryBlobStoreBytes = s.history(ctx)
+	}
+	return h
+}
+func (s *Service) Close(ctx context.Context) error {
+	s.close.Do(func() {
+		if err := s.recorder.Close(ctx); err != nil {
+			s.closeErr = err
+		}
+		if s.pipeline != nil {
+			if err := s.pipeline.Close(ctx); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
+			if err := s.refresher.Close(ctx); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
+		}
+		if err := s.shipper.Close(ctx); err != nil && s.closeErr == nil {
+			s.closeErr = err
+		}
+		if s.cancel != nil {
+			s.cancel()
+			<-s.processor.done
+			if s.eventIndex != nil && s.cfg.PipelineEnabled() {
+				<-s.eventIndex.done
+			}
+		}
+		if err := s.log.Close(); err != nil && s.closeErr == nil {
+			s.closeErr = err
+		}
+		if s.index != nil {
+			if err := s.index.Close(); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
+		}
+		if err := s.store.Close(); err != nil && s.closeErr == nil {
+			s.closeErr = err
+		}
+	})
+	return s.closeErr
+}

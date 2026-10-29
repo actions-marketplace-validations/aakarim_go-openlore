@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/aakarim/go-openlore/assets"
 	"github.com/aakarim/go-openlore/pkg/shell"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -59,8 +60,11 @@ type shellRequest struct {
 }
 
 type toolResponse struct {
-	Output  string `json:"output"`
-	IsError bool   `json:"is_error"`
+	Output   string `json:"output"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	IsError  bool   `json:"is_error"`
+	ExitCode int    `json:"exit_code"`
 }
 
 func (a *MCPHTTPAPI) handleShell(w http.ResponseWriter, r *http.Request) {
@@ -74,7 +78,7 @@ func (a *MCPHTTPAPI) handleShell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.callTool(w, r.Context(), "shell", map[string]any{"command": req.Command})
+	a.callTool(w, r.Context(), "lore_bash", map[string]any{"command": req.Command})
 }
 
 func (a *MCPHTTPAPI) handleListCommands(w http.ResponseWriter, r *http.Request) {
@@ -101,10 +105,21 @@ func (a *MCPHTTPAPI) callTool(w http.ResponseWriter, ctx context.Context, name s
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toolResponse{
-		Output:  contentText(result),
-		IsError: result.IsError,
-	})
+	response := toolResponse{
+		Output:   contentText(result),
+		IsError:  result.IsError,
+		ExitCode: resultExitCode(result),
+	}
+	if structured, ok := result.StructuredContent.(map[string]any); ok {
+		response.Stdout, _ = structured["stdout"].(string)
+		response.Stderr, _ = structured["stderr"].(string)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func resultExitCode(result *mcp.CallToolResult) int {
+	exitCode, _ := exitCodeFromStructured(result.StructuredContent)
+	return exitCode
 }
 
 // connect establishes a fresh in-process client<->server MCP session bound to
@@ -119,7 +134,7 @@ func (a *MCPHTTPAPI) connect(ctx context.Context) (*mcp.ClientSession, error) {
 
 	client := mcp.NewClient(&mcp.Implementation{
 		Name:    "openlore-http-api",
-		Version: "1.0.0",
+		Version: assets.Version(),
 	}, nil)
 
 	session, err := client.Connect(ctx, clientTransport, nil)

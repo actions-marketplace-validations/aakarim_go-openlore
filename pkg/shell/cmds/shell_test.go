@@ -142,6 +142,30 @@ func TestDoubleQuoteExpansion(t *testing.T) {
 	}
 }
 
+// Inside double quotes POSIX removes a backslash only before $, `, ", \ or
+// newline; before any other character the backslash is kept (OPE-48).
+func TestDoubleQuoteBackslash(t *testing.T) {
+	sh := shell.NewShell(testFS())
+	sh.SetEnv("WHO", "world")
+	cases := []struct{ cmd, want string }{
+		{`echo 'single \q'; echo "double \q"; echo "double \\q"; echo "x\|y"`, "single \\q\ndouble \\q\ndouble \\q\nx\\|y"},
+		{`echo "a\qb"`, `a\qb`},
+		{`echo "\$WHO \"hi\" \\ $WHO"`, `$WHO "hi" \ world`},
+		{`echo "foo\.bar"`, `foo\.bar`},
+		{`echo "a\'b"`, `a\'b`},
+		{`printf 'ab\ncd\n' | grep "ab\|cd"`, "ab\ncd"},
+		{`printf 'fooxbar\nfoo.bar\n' | grep "foo\.bar"`, "foo.bar"},
+		{`echo "$(echo "a\qb")"`, `a\qb`},
+	}
+	for _, c := range cases {
+		var out bytes.Buffer
+		sh.ExecPipeline(c.cmd, &out, &bytes.Buffer{}, nil)
+		if got := strings.TrimRight(out.String(), "\n"); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.cmd, got, c.want)
+		}
+	}
+}
+
 func TestSingleQuoteNoExpansion(t *testing.T) {
 	sh := shell.NewShell(testFS())
 	sh.SetEnv("WHO", "world")
@@ -156,6 +180,72 @@ func TestSubshell(t *testing.T) {
 	out, _, _ := execCmd(t, testFS(), "(echo hello; echo world)")
 	if !strings.Contains(out, "hello") || !strings.Contains(out, "world") {
 		t.Errorf("subshell: got %q", out)
+	}
+}
+
+// `exit` ends only the innermost subshell — `( … )`, `$( … )` or a pipeline
+// operand — and that subshell's status becomes $?. At the top level, or in a
+// sourced file, it ends the invocation with status N, or $? when N is omitted.
+func TestExitScope(t *testing.T) {
+	cases := []struct {
+		cmd, want string
+		code      int
+	}{
+		{`echo before; (exit 3); echo "after $?"`, "before\nafter 3", 0},
+		{"echo before; (exit 3)\necho \"nextline=$?\"", "before\nnextline=3", 0},
+		{`(echo in; exit 3; echo no); echo $?`, "in\n3", 0},
+		{`echo "$(echo a; exit 4; echo b) after"`, "a after", 0},
+		{`echo hi | exit 3; echo "after $?"`, "after 3", 0},
+		{`for i in 1 2; do echo $i; exit 7; done; echo no`, "1", 7},
+		{`true && exit 2 || echo no; echo no`, "", 2},
+		{`false; exit`, "", 1},
+		{`! exit 3; echo no`, "", 3},
+		{`exit abc extra; echo no`, "", 2},
+		{`source /docs/exit.sh; echo no`, "a", 4},
+	}
+	for _, tc := range cases {
+		fs := testFS()
+		fs.AddFile("/docs/exit.sh", "echo a\nexit 4\necho b\n")
+		out, _, code := execCmd(t, fs, tc.cmd)
+		if got := strings.TrimRight(out, "\n"); got != tc.want || code != tc.code {
+			t.Errorf("%s: got %q exit %d, want %q exit %d", tc.cmd, got, code, tc.want, tc.code)
+		}
+	}
+}
+
+func TestExitStatusParam(t *testing.T) {
+	cases := []struct{ cmd, want string }{
+		{"false; echo u=$?", "u=1"},
+		{`false; echo "q=$?"`, "q=1"},
+		{"true; echo $?", "0"},
+		{"grep zzqq /docs/notes.txt; echo g=$?", "g=1"},
+		{"nosuchcmd 2>/dev/null; echo $?", "127"},
+		{"! true; echo $?", "1"},
+		{"false || echo $?", "1"},
+		{"false | true; echo $?", "0"},
+		{"if false; then :; else echo $?; fi", "1"},
+		{"false; echo $?; echo $?", "1\n0"},
+		{"true; false | echo $?", "0"},
+		{"false; true | echo $?", "1"},
+		{"false; true |& echo $?", "1"},
+	}
+	for _, tc := range cases {
+		out, _, _ := execCmd(t, testFS(), tc.cmd)
+		if got := strings.TrimRight(out, "\n"); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.cmd, got, tc.want)
+		}
+	}
+}
+
+func TestExitStatusParamAfterParseError(t *testing.T) {
+	sh := shell.NewShell(testFS())
+	if code := sh.ExecPipeline("| echo", &bytes.Buffer{}, &bytes.Buffer{}, nil); code != 2 {
+		t.Fatalf("parse error: exit %d, want 2", code)
+	}
+	var out bytes.Buffer
+	sh.ExecPipeline("echo $?", &out, &bytes.Buffer{}, nil)
+	if got := strings.TrimSpace(out.String()); got != "2" {
+		t.Errorf("$? after parse error: got %q, want %q", got, "2")
 	}
 }
 

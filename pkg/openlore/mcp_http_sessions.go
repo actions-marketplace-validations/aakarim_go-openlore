@@ -1,12 +1,10 @@
 package openlore
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,19 +22,22 @@ const (
 type httpShellSessions struct {
 	factory func(context.Context) *shell.Shell
 	ttl     time.Duration
+	onStart func(context.Context, string)
+	onEnd   func(context.Context, string, time.Duration)
 
 	mu       sync.Mutex
 	sessions map[string]*httpShellSession
 }
 
 type httpShellSession struct {
-	mu         sync.Mutex
-	shell      *shell.Shell
-	owner      string
-	clientRef  string
-	createdAt  time.Time
-	lastUsedAt time.Time
-	expiry     *time.Timer
+	mu          sync.Mutex
+	shell       *shell.Shell
+	owner       string
+	clientRef   string
+	createdAt   time.Time
+	lastUsedAt  time.Time
+	expiry      *time.Timer
+	identityCtx context.Context
 }
 
 type createSessionRequest struct {
@@ -88,16 +89,25 @@ func (s *httpShellSessions) handleCreate(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, http.StatusTooManyRequests, "too many active sessions")
 		return
 	}
+	shellCtx := r.Context()
+	if identity, ok := shellCtx.Value(identityCtxKey{}).(Identity); ok {
+		identity.SessionID, identity.ClientSessionID = id, id
+		shellCtx = contextWithIdentity(shellCtx, identity)
+	}
 	session := &httpShellSession{
-		shell:      s.factory(r.Context()),
-		owner:      owner,
-		clientRef:  strings.TrimSpace(req.ClientRef),
-		createdAt:  now,
-		lastUsedAt: now,
+		shell:       s.factory(shellCtx),
+		owner:       owner,
+		clientRef:   strings.TrimSpace(req.ClientRef),
+		createdAt:   now,
+		lastUsedAt:  now,
+		identityCtx: context.WithoutCancel(shellCtx),
 	}
 	s.sessions[id] = session
 	session.expiry = time.AfterFunc(s.ttl, func() { s.expire(id, session) })
 	s.mu.Unlock()
+	if s.onStart != nil {
+		s.onStart(shellCtx, id)
+	}
 
 	writeJSON(w, http.StatusCreated, createSessionResponse{
 		ID:                 id,
@@ -123,7 +133,7 @@ func (s *httpShellSessions) handleShell(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	session.mu.Lock()
-	result := executeSessionShell(session.shell, req.Command)
+	result := executeSessionShell(r.Context(), session.shell, req.Command)
 	session.mu.Unlock()
 	writeJSON(w, http.StatusOK, result)
 }
@@ -152,6 +162,9 @@ func (s *httpShellSessions) handleDelete(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, http.StatusNotFound, "session not found")
 		return
 	}
+	if s.onEnd != nil {
+		s.onEnd(r.Context(), id, time.Since(session.createdAt))
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -173,6 +186,9 @@ func (s *httpShellSessions) pruneExpiredLocked(now time.Time) {
 		if now.Sub(session.lastUsedAt) >= s.ttl {
 			delete(s.sessions, id)
 			session.expiry.Stop()
+			if s.onEnd != nil {
+				s.onEnd(session.identityCtx, id, now.Sub(session.createdAt))
+			}
 		}
 	}
 }
@@ -190,6 +206,9 @@ func (s *httpShellSessions) expire(id string, expected *httpShellSession) {
 		return
 	}
 	delete(s.sessions, id)
+	if s.onEnd != nil {
+		s.onEnd(session.identityCtx, id, time.Since(session.createdAt))
+	}
 }
 
 func httpSessionOwner(ctx context.Context) string {
@@ -212,15 +231,12 @@ func randomHTTPSessionID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func executeSessionShell(sh *shell.Shell, command string) toolResponse {
-	var stdout, stderr bytes.Buffer
-	exitCode := sh.ExecPipeline(command, &stdout, &stderr, nil)
-	output := stdout.String()
-	if stderr.Len() > 0 {
-		output += "\n" + stderr.String()
+func executeSessionShell(ctx context.Context, sh *shell.Shell, command string) toolResponse {
+	output, stdout, stderr, exitCode := execShellTranscript(ctx, sh, command)
+	return toolResponse{
+		Output:   output,
+		Stdout:   stdout,
+		Stderr:   stderr,
+		ExitCode: exitCode,
 	}
-	if exitCode != 0 {
-		output += fmt.Sprintf("\nexit code: %d", exitCode)
-	}
-	return toolResponse{Output: output}
 }

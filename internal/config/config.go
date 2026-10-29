@@ -7,11 +7,17 @@ import (
 	"log/slog"
 	"math"
 	"mime"
+	"net/url"
 	"os"
+	"path"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aakarim/go-openlore/pkg/rules"
+	"github.com/aakarim/go-openlore/pkg/rules/tokenizer"
 	"github.com/aakarim/go-openlore/pkg/vfs"
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
@@ -21,6 +27,9 @@ import (
 type Config struct {
 	ConfigVersion   string
 	Debug           bool
+	Experimental    []string
+	Analytics       AnalyticsConfig
+	Tracing         TracingConfig
 	Port            int
 	MetricsPort     int
 	HostKeyPath     string
@@ -38,13 +47,17 @@ type Config struct {
 	DataDir         string
 	HTTPPort        int
 	ExternalSSHPort int // advertised SSH port (for X-SSH-Port header behind a LB)
+	// ExternalURL is the externally advertised HTTP origin used in generated
+	// links; its host is also the advertised SSH host. Empty derives both from
+	// passkeys.rp_origins or the local listeners (see HTTPBaseURL).
+	ExternalURL string
 	// MCPEnabled controls whether the always-on MCP-over-HTTP endpoint runs.
 	// Default true. The endpoint is mounted at MCPPath on the HTTP server.
 	MCPEnabled bool
 	MCPPath    string
 	// MCPRequireAuth overrides the SSH-derived authentication posture for the
-	// MCP endpoint. Nil inherits !AllowKeyless; true forces OAuth so clients
-	// such as Claude open the browser login flow.
+	// MCP and JSON API HTTP endpoints. Nil inherits !AllowKeyless; true forces
+	// OAuth so HTTP clients must authenticate.
 	MCPRequireAuth *bool
 	// APIEnabled controls whether the plain JSON HTTP API (backed by the MCP
 	// server) runs. Default true. It is mounted at APIPath on the HTTP server.
@@ -62,6 +75,7 @@ type Config struct {
 	// event-bus `hooks` path with middleware on the read/write chains.
 	Shellexec ShellexecConfig
 	Logger    *slog.Logger
+	Rules     RulesConfig
 
 	// Readonly is the global write lock. Default true: the substrate is a
 	// read-only filesystem and no write verbs are available. Set false to
@@ -82,8 +96,10 @@ type Config struct {
 	// Tokens configures bearer-token issuance/verification for the MCP + HTTP
 	// API. This is server infrastructure (issuer identity, audience, signing
 	// key, TTLs) — not per-lore access policy — so it lives in openlore.yml
-	// alongside passkeys, not in lore.json. When nil, token auth is disabled
-	// and the MCP/HTTP endpoints behave as anonymous callers (Phase 0).
+	// alongside passkeys, not in lore.json. When nil, token auth is disabled:
+	// under a public posture the MCP/HTTP endpoints serve anonymous callers
+	// (Phase 0); under a token-required posture (HTTPAuthRequired) they fail
+	// closed with 401, since no caller can present a token.
 	Tokens  *AuthTokensConfig
 	Inbox   InboxConfig
 	Plugins PluginsConfig
@@ -95,10 +111,179 @@ type Config struct {
 	// hence openlore.yml.
 	OIDCIssuers []OIDCIssuer
 
-	// Track sources for conflict detection.
-	configFileLoaded   bool
-	embeddedConfigUsed bool
-	warnings           []string
+	// ConfigFile is the openlore.yml WithConfigFile read, or empty when the
+	// server runs on defaults or an embedded config.
+	ConfigFile string
+
+	configFileLoaded bool
+	embeddedLoaded   bool
+	warnings         []string
+}
+
+// TracingConfig configures the executable's OTLP/HTTP trace exporter. Nil
+// Enabled infers opt-in from an endpoint; explicit false disables export.
+type TracingConfig struct {
+	Enabled            *bool             `yaml:"enabled"`
+	Endpoint           string            `yaml:"endpoint"`
+	ServiceName        string            `yaml:"service_name"`
+	SampleRatio        *float64          `yaml:"sample_ratio"`
+	Headers            map[string]string `yaml:"headers"`
+	ResourceAttributes map[string]string `yaml:"resource_attributes"`
+}
+
+func (t TracingConfig) Validate() error {
+	if t.Endpoint != "" {
+		u, err := url.Parse(t.Endpoint)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return errors.New("tracing.endpoint must be an http or https URL without credentials, query or fragment")
+		}
+	}
+	if t.SampleRatio != nil && (math.IsNaN(*t.SampleRatio) || *t.SampleRatio < 0 || *t.SampleRatio > 1) {
+		return errors.New("tracing.sample_ratio must be between 0 and 1")
+	}
+	return nil
+}
+
+type AnalyticsConfig struct {
+	Enabled         *bool
+	Dir             string
+	Log             AnalyticsLogConfig
+	Ship            AnalyticsShipConfig
+	Pipeline        AnalyticsPipelineConfig
+	ShutdownTimeout time.Duration
+	Aggregations    AnalyticsAggregationConfig
+	Index           AnalyticsIndexConfig
+	History         AnalyticsHistoryConfig
+	Export          AnalyticsExportConfig
+}
+type AnalyticsLogConfig struct {
+	Rotate    time.Duration
+	Compress  string
+	Retention time.Duration
+}
+type AnalyticsShipConfig struct {
+	Interval time.Duration
+	Remote   string
+}
+type AnalyticsPipelineConfig struct {
+	Enabled *bool
+	Buffer  int
+}
+type AnalyticsAggregationConfig struct {
+	RefreshInterval time.Duration
+	Store           string
+}
+type AnalyticsIndexConfig struct{ Workers int }
+type AnalyticsHistoryConfig struct {
+	Blobs     *bool
+	Retention time.Duration
+}
+type AnalyticsExportConfig struct{ Prometheus bool }
+
+func boolDefault(v *bool, fallback bool) bool {
+	if v == nil {
+		return fallback
+	}
+	return *v
+}
+func (a AnalyticsConfig) IsEnabled() bool           { return boolDefault(a.Enabled, true) }
+func (a AnalyticsConfig) PipelineEnabled() bool     { return boolDefault(a.Pipeline.Enabled, true) }
+func (a AnalyticsConfig) HistoryBlobsEnabled() bool { return boolDefault(a.History.Blobs, true) }
+func (c Config) ExperimentalEnabled(feature string) bool {
+	for _, name := range c.Experimental {
+		if strings.EqualFold(strings.TrimSpace(name), feature) {
+			return true
+		}
+	}
+	return false
+}
+
+// Source describes where the configuration came from, for startup banners:
+// "loaded <path>" when WithConfigFile read a file, "using embedded openlore.yml"
+// when WithEmbeddedConfig applied an embedded config, otherwise "defaults".
+func (c Config) Source() string {
+	switch {
+	case c.configFileLoaded:
+		return "loaded " + c.ConfigFile
+	case c.embeddedLoaded:
+		return "using embedded openlore.yml"
+	default:
+		return "defaults"
+	}
+}
+
+// LocalHTTPURL is the HTTP origin of this process's own listener.
+func (c Config) LocalHTTPURL() string {
+	scheme, defaultPort := "http", 80
+	if c.TLSCert != "" && c.TLSKey != "" {
+		scheme, defaultPort = "https", 443
+	}
+	if c.HTTPPort == defaultPort {
+		return scheme + "://localhost"
+	}
+	return fmt.Sprintf("%s://localhost:%d", scheme, c.HTTPPort)
+}
+
+// HTTPBaseURL is the externally advertised HTTP origin used in generated
+// links: external_url when set, otherwise the first passkeys.rp_origins entry
+// (the origin browsers already use), otherwise the local listener.
+func (c Config) HTTPBaseURL() string {
+	switch {
+	case c.ExternalURL != "":
+		return strings.TrimRight(c.ExternalURL, "/")
+	case len(c.Passkeys.RPOrigins) > 0:
+		return strings.TrimRight(c.Passkeys.RPOrigins[0], "/")
+	default:
+		return c.LocalHTTPURL()
+	}
+}
+
+// AdvertisedHost is the host clients are told to connect to, over both HTTP
+// and SSH: the host of HTTPBaseURL.
+func (c Config) AdvertisedHost() string {
+	if u, err := url.Parse(c.HTTPBaseURL()); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return "localhost"
+}
+
+// AdvertisedSSHPort is the SSH port clients are told to connect to:
+// external_ssh_port when a load balancer remaps it, otherwise port.
+func (c Config) AdvertisedSSHPort() int {
+	if c.ExternalSSHPort != 0 {
+		return c.ExternalSSHPort
+	}
+	return c.Port
+}
+
+// SSHTarget returns the ssh arguments that reach the advertised server, such
+// as "-p 2222 localhost", or just the host when the port is 22.
+func (c Config) SSHTarget() string {
+	return sshTarget(c.AdvertisedHost(), c.AdvertisedSSHPort())
+}
+
+// LocalSSHTarget returns the ssh arguments that reach this process's own
+// listener.
+func (c Config) LocalSSHTarget() string {
+	return sshTarget("localhost", c.Port)
+}
+
+func sshTarget(host string, port int) string {
+	if port == 22 {
+		return host
+	}
+	return fmt.Sprintf("-p %d %s", port, host)
+}
+
+type RulesConfig struct {
+	Growth    float64
+	Tokenizer tokenizer.Tokenizer
+}
+
+// WithRulesTokenizer injects a token counter. The YAML tokenizer setting stays
+// reserved; this option exists for embedders and compatibility tests.
+func WithRulesTokenizer(counter tokenizer.Tokenizer) Option {
+	return func(cfg *Config) error { cfg.Rules.Tokenizer = counter; return nil }
 }
 
 // Warnings returns non-fatal problems encountered while loading configuration.
@@ -257,11 +442,12 @@ type FilesConfig struct {
 
 // AuthConfig is loaded from lore.json.
 type AuthConfig struct {
-	AllowKeyless    *bool                 `json:"allow_keyless,omitempty"`
-	UnknownIdentity string                `json:"unknown_identity,omitempty"`
-	DefaultCwd      string                `json:"default_cwd,omitempty"`
-	Docsets         map[string]DocsetSpec `json:"docsets"`
-	Roles           map[string]RoleSpec   `json:"roles,omitempty"`
+	AllowKeyless    *bool                     `json:"allow_keyless,omitempty"`
+	UnknownIdentity string                    `json:"unknown_identity,omitempty"`
+	DefaultCwd      string                    `json:"default_cwd,omitempty"`
+	Rules           map[string]rules.RuleSpec `json:"rules,omitempty"`
+	Docsets         map[string]DocsetSpec     `json:"docsets"`
+	Roles           map[string]RoleSpec       `json:"roles,omitempty"`
 	// Default is a legacy authority field retained only for JSON parsing. It is ignored.
 	Default    map[string]string `json:"default,omitempty"`
 	Identities []AuthIdentity    `json:"identities"`
@@ -282,6 +468,10 @@ type RoleSpec struct {
 type DocsetAccess struct {
 	Allow map[string]string `json:"allow,omitempty"`
 	Deny  []string          `json:"deny,omitempty"`
+}
+
+type DirConfigPermission struct {
+	Edit []string `json:"edit,omitempty"`
 }
 
 // AuthTokensConfig controls the bearer-token issuer for the MCP + HTTP API.
@@ -312,8 +502,11 @@ type JWKSSpec struct {
 
 // DocsetSpec defines a named set of path mappings.
 type DocsetSpec struct {
-	Paths  []PathMapping `json:"paths"`
-	Access DocsetAccess  `json:"access,omitempty"`
+	Paths      []PathMapping             `json:"paths"`
+	Projection *ProjectionSpec           `json:"projection,omitempty"`
+	Access     DocsetAccess              `json:"access,omitempty"`
+	Rules      map[string]rules.RuleSpec `json:"rules,omitempty"`
+	Config     *DirConfigPermission      `json:"config,omitempty"`
 	// AgentSkills is ignored. Collections are selected dynamically by xattr.
 	AgentSkills bool `json:"-"`
 	// Aliases are alternate display roots for the first path. They expose the
@@ -478,8 +671,11 @@ type Option func(*Config) error
 type fileConfig struct {
 	ConfigVersion       string                 `yaml:"version"`
 	Debug               bool                   `yaml:"debug"`
-	Port                int                    `yaml:"port"`
-	MetricsPort         int                    `yaml:"metrics_port"`
+	Experimental        []string               `yaml:"experimental"`
+	Analytics           analyticsYAML          `yaml:"analytics"`
+	Tracing             TracingConfig          `yaml:"tracing"`
+	Port                *int                   `yaml:"port"`
+	MetricsPort         *int                   `yaml:"metrics_port"`
 	HostKeyPath         string                 `yaml:"host_key_path"`
 	MOTD                string                 `yaml:"motd"`
 	MOTDFile            string                 `yaml:"motd_file"`
@@ -487,8 +683,9 @@ type fileConfig struct {
 	SkillsDir           string                 `yaml:"skills_dir"`
 	WritableDir         string                 `yaml:"writable_dir"`
 	DataDir             string                 `yaml:"data_dir"`
-	HTTPPort            int                    `yaml:"http_port"`
+	HTTPPort            *int                   `yaml:"http_port"`
 	ExternalSSHPort     int                    `yaml:"external_ssh_port"`
+	ExternalURL         string                 `yaml:"external_url"`
 	MCP                 *mcpYAML               `yaml:"mcp"`
 	API                 *apiYAML               `yaml:"api"`
 	TLSCert             string                 `yaml:"tls_cert"`
@@ -502,13 +699,99 @@ type fileConfig struct {
 	Shellexec           *ShellexecConfig       `yaml:"shellexec"`
 	Readonly            *bool                  `yaml:"readonly"`
 	WriteConflictPolicy string                 `yaml:"write_conflict_policy"`
-	MaxJobs             int                    `yaml:"max_jobs"`
+	MaxJobs             *int                   `yaml:"max_jobs"`
+	Rules               rulesYAML              `yaml:"rules"`
 	// Tokens + OIDCIssuers are server infrastructure (bearer-token issuance for
 	// the MCP + HTTP API), hence configured here rather than in lore.json.
 	Tokens      *AuthTokensConfig `yaml:"tokens"`
 	OIDCIssuers []OIDCIssuer      `yaml:"oidc_issuers"`
 	Inbox       *inboxYAML        `yaml:"inbox"`
 	Plugins     pluginsYAML       `yaml:"plugins"`
+}
+
+type analyticsYAML struct {
+	Enabled  *bool                                        `yaml:"enabled"`
+	Dir      string                                       `yaml:"dir"`
+	Log      struct{ Rotate, Compress, Retention string } `yaml:"log"`
+	Ship     struct{ Interval, Remote string }            `yaml:"ship"`
+	Pipeline struct {
+		Enabled *bool `yaml:"enabled"`
+		Buffer  *int  `yaml:"buffer"`
+	} `yaml:"pipeline"`
+	ShutdownTimeout string `yaml:"shutdown_timeout"`
+	Aggregations    struct {
+		RefreshInterval string `yaml:"refresh_interval"`
+		Store           string `yaml:"store"`
+	} `yaml:"aggregations"`
+	Index struct {
+		Workers *int `yaml:"workers"`
+	} `yaml:"index"`
+	History struct {
+		Blobs     *bool  `yaml:"blobs"`
+		Retention string `yaml:"retention"`
+	} `yaml:"history"`
+	Export struct {
+		Prometheus *bool `yaml:"prometheus"`
+	} `yaml:"export"`
+}
+
+func parseAnalyticsDuration(value, name string, target *time.Duration) error {
+	if value == "" {
+		return nil
+	}
+	if strings.HasSuffix(value, "d") {
+		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 64)
+		if err == nil && days >= 0 {
+			*target = time.Duration(days) * 24 * time.Hour
+			return nil
+		}
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil || d < 0 {
+		return fmt.Errorf("invalid analytics %s %q", name, value)
+	}
+	*target = d
+	return nil
+}
+func applyAnalyticsConfig(cfg *Config, in analyticsYAML) error {
+	cfg.Analytics.Enabled = in.Enabled
+	if in.Dir != "" {
+		cfg.Analytics.Dir = in.Dir
+	}
+	cfg.Analytics.Pipeline.Enabled = in.Pipeline.Enabled
+	if err := applyPositiveInt("analytics.pipeline.buffer", in.Pipeline.Buffer, &cfg.Analytics.Pipeline.Buffer); err != nil {
+		return err
+	}
+	cfg.Analytics.History.Blobs = in.History.Blobs
+	if in.Log.Compress != "" {
+		cfg.Analytics.Log.Compress = in.Log.Compress
+	}
+	if in.Ship.Remote != "" {
+		cfg.Analytics.Ship.Remote = in.Ship.Remote
+	}
+	if in.Aggregations.Store != "" {
+		cfg.Analytics.Aggregations.Store = in.Aggregations.Store
+	}
+	if err := applyPositiveInt("analytics.index.workers", in.Index.Workers, &cfg.Analytics.Index.Workers); err != nil {
+		return err
+	}
+	if in.Export.Prometheus != nil {
+		cfg.Analytics.Export.Prometheus = *in.Export.Prometheus
+	}
+	for _, item := range []struct {
+		value, name string
+		target      *time.Duration
+	}{{in.Log.Rotate, "log.rotate", &cfg.Analytics.Log.Rotate}, {in.Log.Retention, "log.retention", &cfg.Analytics.Log.Retention}, {in.Ship.Interval, "ship.interval", &cfg.Analytics.Ship.Interval}, {in.ShutdownTimeout, "shutdown_timeout", &cfg.Analytics.ShutdownTimeout}, {in.Aggregations.RefreshInterval, "aggregations.refresh_interval", &cfg.Analytics.Aggregations.RefreshInterval}, {in.History.Retention, "history.retention", &cfg.Analytics.History.Retention}} {
+		if err := parseAnalyticsDuration(item.value, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type rulesYAML struct {
+	Growth    *float64 `yaml:"growth"`
+	Tokenizer string   `yaml:"tokenizer"`
 }
 
 type authInfrastructureYAML struct {
@@ -556,9 +839,11 @@ func applySkillsConfig(cfg *Config, in skillsPluginYAML) error {
 }
 
 type mcpYAML struct {
-	Enabled     *bool  `yaml:"enabled"`
-	Path        string `yaml:"path"`
-	RequireAuth *bool  `yaml:"require_auth"`
+	Enabled *bool  `yaml:"enabled"`
+	Path    string `yaml:"path"`
+	// RequireAuth governs bearer authentication for both MCP-over-HTTP and the
+	// JSON HTTP API. The setting remains under mcp for configuration compatibility.
+	RequireAuth *bool `yaml:"require_auth"`
 }
 
 type apiYAML struct {
@@ -582,8 +867,9 @@ type filesYAML struct {
 	Ignore  []string `yaml:"ignore"`
 }
 
-// New creates a Config by applying options to the defaults.
-// Returns an error if both a config file and embedded config are used.
+// New creates a Config by applying options to the defaults. When WithConfigFile
+// precedes WithEmbeddedConfig, a loaded file replaces the embedded config.
+// Later options (typically CLI flags) take precedence over both.
 func New(opts ...Option) (Config, error) {
 	cfg := Config{
 		Port:                2222,
@@ -600,12 +886,13 @@ func New(opts ...Option) (Config, error) {
 		Readonly:            true,                           // safe default: read-only substrate
 		WriteConflictPolicy: vfs.DefaultWriteConflictPolicy, // "hash": overwrites are compare-and-swap
 		MaxJobs:             8,                              // bound concurrent async spawn jobs
+		Rules:               RulesConfig{Growth: 1.25},
+		Analytics:           AnalyticsConfig{Dir: "analytics", Log: AnalyticsLogConfig{Rotate: 24 * time.Hour, Compress: "zstd"}, Ship: AnalyticsShipConfig{Interval: 30 * time.Second, Remote: "none"}, Pipeline: AnalyticsPipelineConfig{Buffer: 1024}, ShutdownTimeout: 10 * time.Second, Aggregations: AnalyticsAggregationConfig{RefreshInterval: 5 * time.Minute, Store: "sqlite"}, Index: AnalyticsIndexConfig{Workers: 2}, Export: AnalyticsExportConfig{Prometheus: true}},
 		Plugins:             PluginsConfig{Skills: SkillsPluginConfig{RemoteCheckTTL: 60 * time.Second, RemoteTimeout: 3 * time.Second, RemoteMaxBytes: 10 * 1024 * 1024}},
 		Passkeys: PasskeysConfig{
+			// RPID and RPOrigins default to the effective HTTP address; see below.
 			Enabled:      true,
-			RPID:         "localhost",
 			RPName:       "OpenLore",
-			RPOrigins:    []string{"http://localhost:8080"},
 			LorePath:     "/lore",
 			PasskeysFile: "./config/passkeys.json",
 			SessionTTL:   "24h",
@@ -630,20 +917,60 @@ func New(opts ...Option) (Config, error) {
 			return Config{}, err
 		}
 	}
-
-	if cfg.configFileLoaded && cfg.embeddedConfigUsed {
-		return Config{}, errors.New("conflict: cannot use both a config file and embedded config")
+	if value := os.Getenv("OPENLORE_EXPERIMENTAL"); value != "" {
+		cfg.Experimental = append(cfg.Experimental, strings.Split(value, ",")...)
 	}
-	if cfg.MCPEnabled && cfg.MCPRequireAuth != nil && *cfg.MCPRequireAuth && cfg.Tokens == nil {
+	if err := cfg.Tracing.Validate(); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return Config{}, fmt.Errorf("port must be between 1 and 65535 (SSH cannot be disabled), got %d", cfg.Port)
+	}
+	for _, p := range []struct {
+		name string
+		port int
+	}{{"metrics_port", cfg.MetricsPort}, {"http_port", cfg.HTTPPort}} {
+		if p.port < 0 || p.port > 65535 {
+			return Config{}, fmt.Errorf("%s must be between 0 (disabled) and 65535, got %d", p.name, p.port)
+		}
+	}
+
+	if cfg.ExternalURL != "" {
+		u, err := url.Parse(cfg.ExternalURL)
+		// Server routes are appended to it, so it must be a bare origin.
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
+			(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil || u.Opaque != "" {
+			return Config{}, fmt.Errorf("external_url %q must be an http or https origin such as https://docs.example.com", cfg.ExternalURL)
+		}
+	}
+	// Passkey ceremonies run against the advertised HTTP address, so derive
+	// unset relying-party settings from it rather than from fixed defaults.
+	if len(cfg.Passkeys.RPOrigins) == 0 {
+		cfg.Passkeys.RPOrigins = []string{cfg.HTTPBaseURL()}
+	}
+	if cfg.Passkeys.RPID == "" {
+		cfg.Passkeys.RPID = cfg.AdvertisedHost()
+	}
+	// Generated passkey links open at the advertised address, which WebAuthn
+	// rejects unless it is an allowed origin.
+	if cfg.Passkeys.Enabled && !slices.ContainsFunc(cfg.Passkeys.RPOrigins, func(origin string) bool {
+		return strings.TrimRight(origin, "/") == cfg.HTTPBaseURL()
+	}) {
+		return Config{}, fmt.Errorf("external_url %q must be listed in passkeys.rp_origins when passkeys are enabled", cfg.ExternalURL)
+	}
+
+	if (cfg.MCPEnabled || cfg.APIEnabled) && cfg.MCPRequireAuth != nil && *cfg.MCPRequireAuth && cfg.Tokens == nil {
 		return Config{}, errors.New("mcp.require_auth requires tokens to be configured")
 	}
 
 	return cfg, nil
 }
 
-// WithConfigFile loads configuration from a YAML file.
-// Fields in the file override defaults. If the file does not exist,
-// no error is returned and the config is unchanged.
+// WithConfigFile loads configuration from a YAML file. Fields in the file
+// override defaults. If the file does not exist, no error is returned and the
+// config is unchanged. Apply this option before WithEmbeddedConfig so a loaded
+// file replaces, rather than merges with, the embedded config.
 func WithConfigFile(path string) Option {
 	return func(cfg *Config) error {
 		data, err := os.ReadFile(path)
@@ -661,16 +988,34 @@ func WithConfigFile(path string) Option {
 		cfg.warnings = append(cfg.warnings, warnings...)
 
 		cfg.configFileLoaded = true
+		cfg.ConfigFile = path
+		if err := validateHomeSources(filepath.Dir(path)); err != nil {
+			return err
+		}
+		cfg.Experimental = append([]string(nil), fc.Experimental...)
+		cfg.Tracing = fc.Tracing
+		if err := applyAnalyticsConfig(cfg, fc.Analytics); err != nil {
+			return err
+		}
+		if fc.Rules.Tokenizer != "" {
+			return errors.New("rules.tokenizer is not supported yet")
+		}
+		if fc.Rules.Growth != nil {
+			if *fc.Rules.Growth < 1 {
+				return errors.New("rules.growth must be at least 1")
+			}
+			cfg.Rules.Growth = *fc.Rules.Growth
+		}
 
 		if fc.ConfigVersion != "" {
 			cfg.ConfigVersion = fc.ConfigVersion
 		}
 		cfg.Debug = fc.Debug
-		if fc.Port != 0 {
-			cfg.Port = fc.Port
+		if fc.Port != nil {
+			cfg.Port = *fc.Port // range-checked in New
 		}
-		if fc.MetricsPort != 0 {
-			cfg.MetricsPort = fc.MetricsPort
+		if fc.MetricsPort != nil {
+			cfg.MetricsPort = *fc.MetricsPort
 		}
 		if fc.HostKeyPath != "" {
 			cfg.HostKeyPath = fc.HostKeyPath
@@ -696,11 +1041,14 @@ func WithConfigFile(path string) Option {
 		if fc.DataDir != "" {
 			cfg.DataDir = fc.DataDir
 		}
-		if fc.HTTPPort != 0 {
-			cfg.HTTPPort = fc.HTTPPort
+		if fc.HTTPPort != nil {
+			cfg.HTTPPort = *fc.HTTPPort
 		}
 		if fc.ExternalSSHPort != 0 {
 			cfg.ExternalSSHPort = fc.ExternalSSHPort
+		}
+		if fc.ExternalURL != "" {
+			cfg.ExternalURL = fc.ExternalURL
 		}
 		if fc.TLSCert != "" {
 			cfg.TLSCert = fc.TLSCert
@@ -742,8 +1090,8 @@ func WithConfigFile(path string) Option {
 			}
 			cfg.WriteConflictPolicy = p
 		}
-		if fc.MaxJobs > 0 {
-			cfg.MaxJobs = fc.MaxJobs
+		if err := applyPositiveInt("max_jobs", fc.MaxJobs, &cfg.MaxJobs); err != nil {
+			return err
 		}
 		if err := applySkillsConfig(cfg, fc.Plugins.Skills); err != nil {
 			return err
@@ -770,28 +1118,37 @@ func applyTokensConfig(cfg *Config, tokens *AuthTokensConfig, oidc []OIDCIssuer)
 	}
 }
 
-// WithEmbeddedConfig loads config from an embedded YAML byte slice.
-// The MOTD fallback is set separately from the config fields.
+// WithEmbeddedConfig loads config from an embedded YAML byte slice when no
+// config file has been loaded. WithConfigFile must be applied first when both
+// options are used. The MOTD fallback is set separately from the config fields.
 func WithEmbeddedConfig(data []byte, motdFallback string) Option {
 	return func(cfg *Config) error {
-		if len(data) > 0 {
-			cfg.embeddedConfigUsed = true
+		if cfg.configFileLoaded {
+			return nil
+		}
 
+		if len(data) > 0 {
 			fc, warnings, err := decodeFileConfig(data)
 			if err != nil {
 				return fmt.Errorf("parsing embedded config: %w", err)
 			}
 			cfg.warnings = append(cfg.warnings, warnings...)
+			cfg.embeddedLoaded = true
+			cfg.Experimental = append([]string(nil), fc.Experimental...)
+			cfg.Tracing = fc.Tracing
+			if err := applyAnalyticsConfig(cfg, fc.Analytics); err != nil {
+				return err
+			}
 
 			if fc.ConfigVersion != "" {
 				cfg.ConfigVersion = fc.ConfigVersion
 			}
 			cfg.Debug = fc.Debug
-			if fc.Port != 0 {
-				cfg.Port = fc.Port
+			if fc.Port != nil {
+				cfg.Port = *fc.Port // range-checked in New
 			}
-			if fc.MetricsPort != 0 {
-				cfg.MetricsPort = fc.MetricsPort
+			if fc.MetricsPort != nil {
+				cfg.MetricsPort = *fc.MetricsPort
 			}
 			if fc.HostKeyPath != "" {
 				cfg.HostKeyPath = fc.HostKeyPath
@@ -817,11 +1174,14 @@ func WithEmbeddedConfig(data []byte, motdFallback string) Option {
 			if fc.DataDir != "" {
 				cfg.DataDir = fc.DataDir
 			}
-			if fc.HTTPPort != 0 {
-				cfg.HTTPPort = fc.HTTPPort
+			if fc.HTTPPort != nil {
+				cfg.HTTPPort = *fc.HTTPPort
 			}
 			if fc.ExternalSSHPort != 0 {
 				cfg.ExternalSSHPort = fc.ExternalSSHPort
+			}
+			if fc.ExternalURL != "" {
+				cfg.ExternalURL = fc.ExternalURL
 			}
 			if fc.TLSCert != "" {
 				cfg.TLSCert = fc.TLSCert
@@ -866,8 +1226,8 @@ func WithEmbeddedConfig(data []byte, motdFallback string) Option {
 				}
 				cfg.WriteConflictPolicy = p
 			}
-			if fc.MaxJobs > 0 {
-				cfg.MaxJobs = fc.MaxJobs
+			if err := applyPositiveInt("max_jobs", fc.MaxJobs, &cfg.MaxJobs); err != nil {
+				return err
 			}
 			applyPasskeysConfig(cfg, fc.Passkeys)
 			applyMCPConfig(cfg, fc.MCP)
@@ -905,6 +1265,20 @@ func decodeFileConfig(data []byte) (fileConfig, []string, error) {
 	return fc, append([]string(nil), typeErr.Errors...), nil
 }
 
+// applyPositiveInt copies an optional integer setting into target. Omitted
+// (nil) keeps the default; an explicit zero or negative value is rejected
+// rather than silently replaced by the default.
+func applyPositiveInt(key string, value *int, target *int) error {
+	if value == nil {
+		return nil
+	}
+	if *value <= 0 {
+		return fmt.Errorf("%s must be a positive integer, got %d (omit the key to use the default %d)", key, *value, *target)
+	}
+	*target = *value
+	return nil
+}
+
 // WithPort sets the SSH server port.
 func WithPort(port int) Option {
 	return func(cfg *Config) error {
@@ -917,6 +1291,14 @@ func WithPort(port int) Option {
 func WithMetricsPort(port int) Option {
 	return func(cfg *Config) error {
 		cfg.MetricsPort = port
+		return nil
+	}
+}
+
+// WithAnalyticsEnabled enables or disables the built-in analytics service.
+func WithAnalyticsEnabled(enabled bool) Option {
+	return func(cfg *Config) error {
+		cfg.Analytics.Enabled = &enabled
 		return nil
 	}
 }
@@ -1103,13 +1485,19 @@ func applyMCPConfig(cfg *Config, m *mcpYAML) {
 	}
 }
 
-// MCPAuthRequired resolves the MCP-specific override. When it is omitted, MCP
-// retains the historical behavior of mirroring the SSH keyless posture.
-func (cfg Config) MCPAuthRequired() bool {
+// HTTPAuthRequired resolves the authentication posture shared by MCP-over-HTTP
+// and the JSON HTTP API. When omitted, both mirror the SSH keyless posture.
+func (cfg Config) HTTPAuthRequired() bool {
 	if cfg.MCPRequireAuth != nil {
 		return *cfg.MCPRequireAuth
 	}
 	return !cfg.AllowKeyless
+}
+
+// MCPAuthRequired is kept for compatibility. Use HTTPAuthRequired for the
+// shared MCP-over-HTTP and JSON API posture.
+func (cfg Config) MCPAuthRequired() bool {
+	return cfg.HTTPAuthRequired()
 }
 
 // WithMCPPath sets the path the MCP-over-HTTP endpoint is mounted at on the
@@ -1216,6 +1604,9 @@ func LoadAuthConfig(path string) (*AuthConfig, error) {
 // ValidateAuthConfig validates a parsed static authorization policy. Legacy
 // authority fields are deliberately ignored.
 func ValidateAuthConfig(auth *AuthConfig) error {
+	if err := desugarOKFRules(auth); err != nil {
+		return err
+	}
 	if _, ok := auth.Roles["guest"]; ok {
 		return fmt.Errorf("role %q is reserved", "guest")
 	}
@@ -1332,6 +1723,44 @@ func ValidateAuthConfig(auth *AuthConfig) error {
 		}
 	}
 	for docset, ds := range auth.Docsets {
+		if ds.Projection != nil {
+			p := ds.Projection
+			parts := strings.Split(p.Store, "/")
+			if docset == "" || strings.ContainsAny(docset, "/\\") || !validProjectionPath(p.Store) || len(parts) < 2 || (parts[0] != "openlore" && len(parts) < 3) || (parts[0] == "git" && len(parts) < 4) || (parts[0] != "claude" && parts[0] != "git" && parts[0] != "folder" && parts[0] != "openlore") || (p.Subpath != "" && !validProjectionPath(p.Subpath)) {
+				return fmt.Errorf("docset %q has invalid projection store/subpath", docset)
+			}
+			// A projection has no backing source directory: it mounts at a
+			// single display path, /<docset> unless one path says otherwise.
+			mount := "/" + docset
+			if len(ds.Paths) > 0 {
+				if len(ds.Paths) != 1 || ds.Paths[0].Display != "" && ds.Paths[0].Display != ds.Paths[0].Source {
+					return fmt.Errorf("projection %q must declare one path", docset)
+				}
+				mount = ds.Paths[0].Source
+				if !strings.HasPrefix(mount, "/") || mount == "/" || path.Clean(mount) != mount {
+					return fmt.Errorf("projection %q path %q must be an absolute, normalized path below /", docset, mount)
+				}
+			}
+			for _, pattern := range append(append([]string{}, p.Include...), p.Exclude...) {
+				if _, err := path.Match(pattern, ""); err != nil {
+					return fmt.Errorf("projection %q invalid glob %q", docset, pattern)
+				}
+			}
+			ds.Paths = []PathMapping{{Source: mount, Display: mount}}
+			readonly := true
+			ds.Readonly = &readonly
+			auth.Docsets[docset] = ds
+		}
+		if ds.Config != nil {
+			if err := validateNames(fmt.Sprintf("docset %q config.edit roles", docset), ds.Config.Edit); err != nil {
+				return err
+			}
+			for _, role := range ds.Config.Edit {
+				if _, ok := auth.Roles[role]; !ok {
+					return fmt.Errorf("docset %q config.edit references unknown role %q", docset, role)
+				}
+			}
+		}
 		for role, grant := range ds.Access.Allow {
 			if grant == "" || strings.TrimSpace(grant) != grant {
 				return fmt.Errorf("docset %q has invalid grant for role %q", docset, role)
@@ -1366,5 +1795,44 @@ func ValidateAuthConfig(auth *AuthConfig) error {
 		}
 	}
 
+	return nil
+}
+
+func desugarOKFRules(auth *AuthConfig) error {
+	for name, docset := range auth.Docsets {
+		if docset.OKF == nil {
+			continue
+		}
+		patterns := docset.OKF.Patterns
+		if len(patterns) == 0 {
+			patterns = []string{"*.md"}
+		}
+		matches := make([]string, 0, len(patterns))
+		for _, pattern := range patterns {
+			matches = append(matches, "**/"+pattern)
+		}
+		expected := rules.RuleSpec{Match: matches, Use: "okf", Enforce: docset.OKF.Enforce}
+		if docset.Rules == nil {
+			docset.Rules = map[string]rules.RuleSpec{}
+		}
+		if explicit, ok := docset.Rules["okf"]; ok {
+			if !explicit.Equal(expected) {
+				return fmt.Errorf("docset %q has conflicting okf and rules.okf configuration", name)
+			}
+		} else {
+			docset.Rules["okf"] = expected
+		}
+		if _, ok := docset.Rules["okf/bundle"]; !ok {
+			docset.Rules["okf/bundle"] = rules.RuleSpec{Match: []string{"**/*.md"}, Use: "okf/bundle", Enforce: docset.OKF.Enforce}
+		}
+		if _, ok := docset.Rules["link/resolves"]; !ok {
+			docset.Rules["link/resolves"] = rules.RuleSpec{Match: []string{"**/*.md"}, Use: "link/resolves", Enforce: docset.OKF.Enforce}
+		}
+		if _, ok := docset.Rules["link/alias"]; !ok {
+			warn := false
+			docset.Rules["link/alias"] = rules.RuleSpec{Match: []string{"**/*.md"}, Use: "link/alias", Enforce: &warn}
+		}
+		auth.Docsets[name] = docset
+	}
 	return nil
 }

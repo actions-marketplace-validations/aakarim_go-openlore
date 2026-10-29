@@ -15,11 +15,17 @@ var configFS embed.FS
 //go:embed all:skills
 var skillsFS embed.FS
 
-//go:embed all:web
-var webFS embed.FS
+//go:embed all:site
+var siteFS embed.FS
 
 //go:embed all:legal
 var legalFS embed.FS
+
+// dashboard contains a tracked placeholder so this package also builds before
+// the generated dashboard/dist directory exists.
+//
+//go:embed all:dashboard
+var dashboardFS embed.FS
 
 //go:embed config/motd.txt
 var defaultMOTD string
@@ -73,9 +79,32 @@ func Skills() fs.FS {
 	return sub
 }
 
-// Web returns the embedded web assets filesystem (rooted inside web/).
-func Web() fs.FS {
-	sub, _ := fs.Sub(webFS, "web")
+// Site returns the replaceable static website (rooted inside site/). OpenLore's
+// application routes and assets are served separately and are not part of this
+// filesystem.
+func Site() fs.FS {
+	sub, _ := fs.Sub(siteFS, "site")
+	return sub
+}
+
+// Dashboard returns the generated dashboard assets, rooted inside
+// dashboard/dist. It returns nil when the frontend has not been built.
+func Dashboard() fs.FS {
+	sub, err := fs.Sub(dashboardFS, "dashboard")
+	if err != nil {
+		return nil
+	}
+	return dashboard(sub)
+}
+
+func dashboard(fsys fs.FS) fs.FS {
+	sub, err := fs.Sub(fsys, "dist")
+	if err != nil {
+		return nil
+	}
+	if _, err := fs.Stat(sub, "index.html"); err != nil {
+		return nil
+	}
 	return sub
 }
 

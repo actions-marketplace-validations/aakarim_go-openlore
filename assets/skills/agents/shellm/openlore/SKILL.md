@@ -1,6 +1,6 @@
 ---
 name: openlore
-description: Query and publish to an OpenLore knowledge base over SSH using ordinary shell commands. Use when a task needs project documentation, runbooks, shared team knowledge, or a place to publish findings.
+description: Query and publish to an OpenLore knowledge repository over SSH using ordinary shell commands. Use when a task needs project documentation, runbooks, shared team knowledge, or a place to publish findings.
 metadata:
   shelllm:
     requires:
@@ -15,15 +15,15 @@ SSH session.
 
 ## Target server
 
-Set `OPENLORE_SSH` to the SSH arguments for your OpenLore server, for example:
+Set `OPENLORE_SSH` to the SSH arguments for this OpenLore server:
 
-```bash
-export OPENLORE_SSH="-p 2222 localhost"
+```shell
+export OPENLORE_SSH="{{ ssh_target }}"
 ```
 
 Then run commands non-interactively:
 
-```bash
+```shell
 ssh $OPENLORE_SSH "tree -L 2 /"
 ```
 
@@ -32,50 +32,71 @@ variables does not persist between invocations, so use absolute paths.
 
 ## Reading and searching
 
-```bash
+```shell
 # Discover what is available
 ssh $OPENLORE_SSH "tree -L 2 /"
 
-# Search across all docs
-ssh $OPENLORE_SSH "grep -rn 'search term' /docs"
+# Search across the docs
+ssh $OPENLORE_SSH "grep -rn 'search term' {{.Mount}}"
 
 # Read a specific file
-ssh $OPENLORE_SSH "cat /docs/README.md"
+ssh $OPENLORE_SSH "cat {{.File}}"
 
 # Find files by name
-ssh $OPENLORE_SSH "find / -name '*.md'"
+ssh $OPENLORE_SSH "find {{.Mount}} -name '*.md'"
 
 # Query structured frontmatter as NDJSON
-ssh $OPENLORE_SSH "lore meta /docs | jq -r '.path'"
+ssh $OPENLORE_SSH "lore meta {{.Mount}} | jq -r '.path'"
 ```
-
+{{if .Mounts}}
+Documentation is mounted at {{range $i, $m := .Mounts}}{{if $i}}, {{end}}`{{$m}}`{{end}}; run
+`ssh $OPENLORE_SSH "lore docsets"` to see each mount with your access level.
+{{end}}
 Pipes, `jq`, `sed`, `awk`, `sort`, `xargs`, and most other coreutils work
 inside the remote command. Run `ssh $OPENLORE_SSH "help"` for the full list.
 
 ## Publishing findings
+{{if .Publish}}
+This identity can publish to {{range $i, $t := .Publish}}{{if $i}}, {{end}}`/{{$t.Name}}/`{{end}}. The
+argument is one path, `/<docset>/<file>`, where the docset name is the first
+segment; the file lands in that docset's inbox for human review:
 
-If your identity has publish or write access, store results back into the
-knowledge base:
-
-```bash
+```shell
 # List docsets you can publish to
 ssh $OPENLORE_SSH "publish"
 
 # Publish a report from stdin
-cat report.md | ssh $OPENLORE_SSH "publish <docset> reports/report.md"
+cat report.md | ssh $OPENLORE_SSH "publish /{{.PublishDocset}}/reports/report.md"
 ```
 
 Writes are atomic and conflict-aware; a rejected write returns a non-zero exit
 status with an explanation on stderr.
+{{else if .Writable}}
+This identity can write directly to {{range $i, $m := .Writable}}{{if $i}}, {{end}}`{{$m}}`{{end}} with
+the ordinary write verbs:
 
-## Sharing run trajectories
+```shell
+cat report.md | ssh $OPENLORE_SSH "cat > {{sub (index .Writable 0) "report.md"}}"
+```
 
-If the server has a writable `trajectories` docset, publish completed shellm
-trajectory directories so teammates and other agents can read them. Sync the
-whole directory — `trajectory.jsonl`, `blobs/`, and nested child-run
-directories — uploading blobs before the JSONL that references them:
+Writes are atomic and conflict-aware; a rejected write returns a non-zero exit
+status with an explanation on stderr.
+{{else}}
+This identity is read-only. Ask the server operator for a `publish` grant to
+store findings; `ssh $OPENLORE_SSH "publish"` then lists the docsets you can
+write to, and `publish /<docset>/<file>` publishes stdin into that docset's
+inbox for human review.
+{{end}}
+{{if exists "/trajectories"}}## Sharing run trajectories
 
-```bash
+This server has a `/trajectories` docset where completed shellm trajectory
+directories are shared so teammates and other agents can read them.
+{{if writable "/trajectories"}}
+This identity can write to it directly. Sync the whole directory —
+`trajectory.jsonl`, `blobs/`, and nested child-run directories — uploading
+blobs before the JSONL that references them:
+
+```shell
 sync_traj() {
   local dir="$1" dest="/trajectories/$(basename "$1")"
   (cd "$dir" && find . -type f | sort | while read -r f; do
@@ -93,14 +114,17 @@ trajectories on the host, even when generated code runs in Docker). For a
 still-growing `trajectory.jsonl`, append new lines with `tee -a`, which is
 always a conflict-safe atomic append. Never point `SHELLM_TRAJ_DIR` at a
 network mount of OpenLore; sync copies instead.
-
+{{else}}
+This identity cannot write to `/trajectories`; ask the server operator for a
+`rw` grant on it before trying to sync runs there.
+{{end}}
 Read shared trajectories from any session:
 
-```bash
+```shell
 ssh $OPENLORE_SSH "cat /trajectories/<run>/trajectory.jsonl | jq -r 'select(.type == \"final\") | .content'"
 ```
 
-## Notes
+{{end}}## Notes
 
 - The remote shell is OpenLore's sandboxed in-memory interpreter, not a real
   operating system: there is no process execution, network access, or shell
@@ -122,11 +146,11 @@ ssh $OPENLORE_SSH "cat /trajectories/<run>/trajectory.jsonl | jq -r 'select(.typ
 
 From a machine with access to an OpenLore server:
 
-```bash
+```shell
 mkdir -p .skills/openlore .skills/openlore-housekeeping
 ssh $OPENLORE_SSH agents-shellm > .skills/openlore/SKILL.md
 ssh $OPENLORE_SSH agents-shellm-housekeeping > .skills/openlore-housekeeping/SKILL.md
 ```
 
-The companion `openlore-housekeeping` skill audits the knowledge base and
+The companion `openlore-housekeeping` skill audits the knowledge repository and
 publishes maintenance reports.

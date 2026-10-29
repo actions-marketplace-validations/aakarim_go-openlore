@@ -2,38 +2,85 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/v0.7.0]
   pull_request:
-    branches: [main]
+    branches: [main, release/v0.7.0]
 
 jobs:
-  build:
+  dashboard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
+      - uses: cachix/install-nix-action@v31
+
+      - name: Check, test, and build dashboard
+        run: nix develop --command make dashboard-ci
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
 
       - name: Build
-        run: go build ./...
+        run: nix develop --command go build ./...
+
+      - name: Verify generated documentation
+        run: |
+          nix develop --command go generate ./docs/...
+          git diff --exit-code docs/reference/rules-stdlib.md
 
       - name: Test
-        run: go test -race ./...
+        run: nix develop --command go test -race ${{ github.event_name == 'push' && '-short' || '' }} ./...
+
+  integration:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [test-analytics-s3, test-filesystem-s3, test-litestream]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Run integration suite
+        run: nix develop --command make ${{ matrix.target }}
+
+  # Preserve the existing build status as a gate over all its former steps.
+  build:
+    if: always()
+    needs: [dashboard, go, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful checks
+        env:
+          DASHBOARD_RESULT: ${{ needs.dashboard.result }}
+          GO_RESULT: ${{ needs.go.result }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$DASHBOARD_RESULT" = success
+          test "$GO_RESULT" = success
+          if [ "$EVENT_NAME" = pull_request ]; then
+            test "$INTEGRATION_RESULT" = success
+          else
+            test "$INTEGRATION_RESULT" = skipped
+          fi
 
   libghostty:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
+      - uses: cachix/install-nix-action@v31
 
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
       - name: Test terminal rendering with libghostty
-        run: make test-libghostty
+        run: nix develop --command make test-libghostty

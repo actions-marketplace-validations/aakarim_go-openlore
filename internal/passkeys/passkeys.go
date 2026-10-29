@@ -1,6 +1,7 @@
 package passkeys
 
 import (
+	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -48,6 +49,9 @@ type Config struct {
 	LorePath     string
 	PasskeysFile string
 	SessionTTL   time.Duration
+	// SSHPort is the port people reach the shell on. The login page uses it
+	// to print a runnable `passkey register` command when none is registered.
+	SSHPort int
 }
 
 // Passkeys orchestrates WebAuthn registration and login ceremonies and serves
@@ -61,8 +65,9 @@ type Passkeys struct {
 	pending  *PendingStore
 	logger   *slog.Logger
 
-	auth   *config.AuthConfig
-	tokens TokenIssuer
+	auth    *config.AuthConfig
+	tokens  TokenIssuer
+	onLogin func(context.Context, string, string)
 
 	// loginSessions holds in-flight discoverable-login ceremonies keyed by the
 	// short-lived openlore_login cookie token.
@@ -120,6 +125,16 @@ func (p *Passkeys) SetAuthConfig(auth *config.AuthConfig) {
 // the browser session cookie.
 func (p *Passkeys) SetTokenIssuer(ti TokenIssuer) {
 	p.tokens = ti
+}
+
+func (p *Passkeys) SetLoginObserver(observer func(context.Context, string, string)) {
+	p.onLogin = observer
+}
+
+// CredentialCount reports how many passkeys are registered. Zero means no
+// browser can sign in yet, which is the same fact the login page shows.
+func (p *Passkeys) CredentialCount() int {
+	return len(p.store.AllCredentials())
 }
 
 // Shutdown stops background goroutines.
@@ -252,7 +267,7 @@ func (p *Passkeys) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 
 func (p *Passkeys) handleLoginStatus(w http.ResponseWriter, r *http.Request) {
 	creds := p.store.AllCredentials()
-	writeJSON(w, map[string]any{"count": len(creds), "has_passkeys": len(creds) > 0})
+	writeJSON(w, map[string]any{"count": len(creds), "has_passkeys": len(creds) > 0, "ssh_port": p.cfg.SSHPort})
 }
 
 func (p *Passkeys) handleLoginBegin(w http.ResponseWriter, r *http.Request) {
@@ -332,9 +347,13 @@ func (p *Passkeys) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 	// Set the browser session cookie for the /lore docs browser. The cookie
 	// carries the identity name; the browser resolves its grants live from the
 	// identity table.
-	if err := p.sessions.SetCookie(w, matched.Identity); err != nil {
+	sessionID, err := p.sessions.SetCookie(w, matched.Identity)
+	if err != nil {
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
+	}
+	if p.onLogin != nil {
+		p.onLogin(r.Context(), matched.Identity, sessionID)
 	}
 
 	// OAuth authorization-code flow: if this login was reached via /authorize

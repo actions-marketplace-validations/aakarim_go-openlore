@@ -247,7 +247,7 @@ func verifyPKCE(method, verifier, challenge string) bool {
 // external IdP assertion, matches its claims to a rule, and mints a short-lived
 // OpenLore access token for the resolved identity. It issues NO refresh token —
 // workloads re-exchange a fresh assertion, keeping WIF free of long-lived
-// credentials. See docs/mcp-bearer-auth.md §8.1 and workload-identity-federation.md.
+// credentials. See docs/concepts/auth.md (Workload Identity Federation).
 func (t *tokenEndpoint) handleJWTBearer(w http.ResponseWriter, r *http.Request) {
 	if t.wif == nil {
 		oauthError(w, http.StatusBadRequest, "unsupported_grant_type",
@@ -350,7 +350,8 @@ func (t *tokenEndpoint) handleRefreshToken(w http.ResponseWriter, r *http.Reques
 	}
 	rotation, err := t.refresh.Rotate(presented, newRefresh)
 	if err != nil {
-		// Reuse or invalid → deny (chain already revoked on reuse).
+		// A stale credential from an authenticated client is denied without
+		// changing its successor. Public-client reuse revokes the chain.
 		t.recordRefresh(r.Context(), "rotation_rejected", old, err)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token rejected")
 		return

@@ -44,6 +44,20 @@ func (f *readTransformFS) ReadFile(p string) ([]byte, error) {
 	return b, nil
 }
 
+func (f *readTransformFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	b, err := readFileBounded(f.FileSystem, p, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	for _, transform := range f.transforms {
+		b = transform(p, b)
+		if int64(len(b)) > maxBytes {
+			return nil, errFileTooLarge
+		}
+	}
+	return b, nil
+}
+
 var _ vfs.FileSystem = (*readTransformFS)(nil)
 
 func (f *readTransformFS) LastReadHash(p string) (string, bool) {
@@ -52,6 +66,10 @@ func (f *readTransformFS) LastReadHash(p string) (string, bool) {
 		return "", false
 	}
 	return r.LastReadHash(p)
+}
+
+func (f *readTransformFS) ReadContentHash(_ string, content []byte) string {
+	return hashBytes(content)
 }
 
 func (f *readTransformFS) CanWrite(p string) bool {
@@ -126,6 +144,10 @@ func (f *writableReadTransformFS) ReadFile(p string) ([]byte, error) {
 	return b, nil
 }
 
+func (f *writableReadTransformFS) ReadFileBounded(p string, maxBytes int64) ([]byte, error) {
+	return (&readTransformFS{FileSystem: f.WritableFS, transforms: f.transforms}).ReadFileBounded(p, maxBytes)
+}
+
 func (f *writableReadTransformFS) AdmitChangeSet(cs vfs.ChangeSet) error {
 	a, ok := f.WritableFS.(vfs.ChangeSetAdmitter)
 	if !ok {
@@ -138,6 +160,9 @@ var _ vfs.WritableFS = (*writableReadTransformFS)(nil)
 
 func (f *writableReadTransformFS) LastReadHash(p string) (string, bool) {
 	return (&readTransformFS{FileSystem: f.WritableFS}).LastReadHash(p)
+}
+func (f *writableReadTransformFS) ReadContentHash(_ string, content []byte) string {
+	return hashBytes(content)
 }
 func (f *writableReadTransformFS) CanWrite(p string) bool {
 	return (&readTransformFS{FileSystem: f.WritableFS}).CanWrite(p)
@@ -166,12 +191,14 @@ func (f *writableReadTransformFS) MigrateXattrs(p string, migration vfs.XattrMig
 
 var (
 	_ vfs.ReadTracker       = (*readTransformFS)(nil)
+	_ vfs.ReadContentHasher = (*readTransformFS)(nil)
 	_ vfs.XattrReader       = (*readTransformFS)(nil)
 	_ vfs.XattrWriter       = (*readTransformFS)(nil)
 	_ vfs.XattrMaintenance  = (*readTransformFS)(nil)
 	_ vfs.WriteScopeFS      = (*readTransformFS)(nil)
 	_ vfs.PathCanonicalizer = (*readTransformFS)(nil)
 	_ vfs.ReadTracker       = (*writableReadTransformFS)(nil)
+	_ vfs.ReadContentHasher = (*writableReadTransformFS)(nil)
 	_ vfs.XattrReader       = (*writableReadTransformFS)(nil)
 	_ vfs.XattrWriter       = (*writableReadTransformFS)(nil)
 	_ vfs.XattrMaintenance  = (*writableReadTransformFS)(nil)

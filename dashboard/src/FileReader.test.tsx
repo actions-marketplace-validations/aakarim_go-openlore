@@ -1,0 +1,428 @@
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { vi } from "vitest";
+import { api } from "./api";
+import {
+  Details,
+  FileReader,
+  MobileDetails,
+  Sheet,
+  resolveLorePath,
+} from "./FileReader";
+import type { FileResponse, Session } from "./types";
+
+const session: Session = {
+  identity: "reader@example.test",
+  lore_path: "/lore",
+  access: false,
+};
+const baseFile: FileResponse = {
+  path: "/docs/readme.txt",
+  name: "readme.txt",
+  source: "Plain text knowledge",
+  content_type: "text/plain",
+  facts: { bytes: 20, lines: 1, characters: 13, tokens: 999 },
+  binary: false,
+};
+const readerProps = {
+  path: baseFile.path,
+  session,
+  mode: "preview" as const,
+  onMode: vi.fn(),
+  onFile: vi.fn(),
+  onAnalytics: vi.fn(),
+  onCopy: vi.fn(),
+  ratio: 6,
+  contextWindow: 12,
+  scrollPosition: 0,
+  onScroll: vi.fn(),
+};
+
+test("renders plaintext preview and estimates FileInfo from characters and ratio", async () => {
+  vi.spyOn(api, "file").mockResolvedValue(baseFile);
+  render(<FileReader {...readerProps} />);
+
+  expect(await screen.findByText("Plain text knowledge")).toBeVisible();
+  expect(screen.getByText("3")).toBeVisible();
+  expect(screen.getByText("25.00%")).toBeVisible();
+  expect(screen.queryByText("999")).not.toBeInTheDocument();
+});
+
+test.each(["preview", "source"] as const)(
+  "refresh replaces stale file content in %s mode",
+  async (mode) => {
+    vi.spyOn(api, "file")
+      .mockResolvedValueOnce(baseFile)
+      .mockResolvedValueOnce({
+        ...baseFile,
+        source: "Updated knowledge",
+        html: "<p>Updated preview</p>",
+      });
+    render(<FileReader {...readerProps} mode={mode} />);
+    const user = userEvent.setup();
+    expect(await screen.findByText("Plain text knowledge")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Refresh file" }));
+
+    expect(
+      await screen.findByText(
+        mode === "preview" ? "Updated preview" : "Updated knowledge",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText("Plain text knowledge")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: mode === "preview" ? "Preview" : "Source",
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+  },
+);
+
+test("a failed refresh can be retried without reopening the file", async () => {
+  vi.spyOn(api, "file")
+    .mockResolvedValueOnce(baseFile)
+    .mockRejectedValueOnce(new Error("Connection lost"))
+    .mockResolvedValueOnce({ ...baseFile, source: "Recovered knowledge" });
+  render(<FileReader {...readerProps} />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Refresh file" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Connection lost");
+  await user.click(screen.getByRole("button", { name: "Try again" }));
+
+  expect(await screen.findByText("Recovered knowledge")).toBeVisible();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+test("filename tooltip shows the full path on hover, focus, or click and dismisses on Escape or blur", async () => {
+  const path = "/docs/team notes/drafts/plan.md";
+  vi.spyOn(api, "file").mockResolvedValue({ ...baseFile, path });
+  const onFile = vi.fn();
+  render(<FileReader {...readerProps} path={path} onFile={onFile} />);
+  const user = userEvent.setup();
+  const filename = await screen.findByRole("button", {
+    name: "Show path for plan.md",
+  });
+  expect(filename).toHaveTextContent("plan.md");
+  expect(filename).toHaveAccessibleDescription(path);
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("navigation", { name: "File location" }),
+  ).not.toBeInTheDocument();
+  await user.hover(filename);
+  expect(screen.getByRole("tooltip")).toHaveTextContent(path);
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  await user.unhover(filename);
+  await user.hover(filename);
+  expect(screen.getByRole("tooltip")).toBeVisible();
+  await user.unhover(filename);
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  await user.tab();
+  expect(filename).toHaveFocus();
+  expect(screen.getByRole("tooltip")).toBeVisible();
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  expect(filename).toHaveFocus();
+  await user.click(filename);
+  expect(screen.getByRole("tooltip")).toHaveTextContent(path);
+  await user.unhover(filename);
+  expect(screen.getByRole("tooltip")).toBeVisible();
+  await user.tab();
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  expect(onFile).not.toHaveBeenCalled();
+});
+
+test("canonicalizes internal links once, preserves modified clicks, and protects images", async () => {
+  const onFile = vi.fn();
+  const file: FileResponse = {
+    ...baseFile,
+    path: "/docs/current.md",
+    html: `<a id="relative" href="a%20b.md#part">Relative</a>
+      <a id="absolute" href="${location.origin}/lore/shared/guide.md">Absolute</a>
+      <a id="remote" href="https://outside.example/guide" target="_blank">Remote</a>
+      <a id="protocol-relative" href="//outside.example/guide" target="_blank">Protocol relative</a>
+      <a id="email" href="mailto:reader@example.test" target="_blank">Email</a>
+      <img alt="local" src="images/pic%20one.png">
+      <img alt="remote image" src="https://outside.example/pixel.png">`,
+  };
+  vi.spyOn(api, "file").mockResolvedValue(file);
+  render(<FileReader {...readerProps} path={file.path} onFile={onFile} />);
+
+  const relative = (await screen.findByText("Relative")) as HTMLAnchorElement;
+  await waitFor(() =>
+    expect(relative.href).toBe(`${location.origin}/lore/docs/a%20b.md#part`),
+  );
+  expect(relative.href).not.toContain("%2520");
+  fireEvent.click(relative);
+  expect(onFile).toHaveBeenCalledWith("/docs/a b.md");
+
+  const modified = new MouseEvent("click", {
+    bubbles: true,
+    cancelable: true,
+    ctrlKey: true,
+  });
+  relative.dispatchEvent(modified);
+  expect(modified.defaultPrevented).toBe(false);
+  expect(onFile).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByText("Absolute"));
+  expect(onFile).toHaveBeenLastCalledWith("/shared/guide.md");
+  expect(screen.getByText("Remote")).not.toHaveAttribute("target");
+  expect(screen.getByText("Remote")).toHaveAttribute("rel", "noreferrer");
+  expect(screen.getByText("Protocol relative")).not.toHaveAttribute("target");
+  expect(screen.getByText("Email")).not.toHaveAttribute("target");
+  const localImage = screen.getByAltText("local") as HTMLImageElement;
+  expect(new URL(localImage.src).pathname).toBe("/dashboard/api/raw");
+  expect(new URL(localImage.src).searchParams.get("path")).toBe(
+    "/docs/images/pic one.png",
+  );
+  expect(screen.getByAltText("remote image")).not.toHaveAttribute("src");
+  expect(resolveLorePath("a%20b.md", "/docs/current.md")).toBe("/docs/a b.md");
+});
+
+test("wraps markdown tables in distinct keyboard-scrollable regions", async () => {
+  const file: FileResponse = {
+    ...baseFile,
+    path: "/docs/events.md",
+    html: `<table><caption>Upcoming events</caption><thead><tr><th>Event</th><th>Date</th></tr></thead>
+      <tbody><tr><td>OpenLore Summit</td><td>23 Sep 2026</td></tr></tbody></table>
+      <table><tbody><tr><td>Past event</td></tr></tbody></table>`,
+  };
+  vi.spyOn(api, "file").mockResolvedValue(file);
+  const view = render(<FileReader {...readerProps} path={file.path} />);
+
+  const captioned = await screen.findByRole("region", {
+    name: "Upcoming events",
+  });
+  const fallback = screen.getByRole("region", { name: "Scrollable table 2" });
+  expect(captioned).toHaveAttribute("tabindex", "0");
+  expect(captioned).toHaveClass("markdown-table");
+  expect(captioned).toContainElement(view.container.querySelector("table"));
+  expect(fallback).toHaveClass("markdown-table");
+});
+
+test("restores and tracks window scroll on mobile while desktop uses document scroll", async () => {
+  vi.spyOn(api, "file").mockResolvedValue(baseFile);
+  let scrollY = 456;
+  Object.defineProperty(window, "scrollY", {
+    configurable: true,
+    get: () => scrollY,
+  });
+  const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  vi.mocked(matchMedia).mockImplementation(
+    (query) => ({ matches: query.includes("max-width") }) as MediaQueryList,
+  );
+  const onScroll = vi.fn();
+  const { unmount } = render(
+    <FileReader {...readerProps} scrollPosition={123} onScroll={onScroll} />,
+  );
+  await screen.findByText("Plain text knowledge");
+  await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(0, 123));
+  fireEvent.scroll(window);
+  expect(onScroll).toHaveBeenCalledWith(456);
+  unmount();
+
+  vi.mocked(matchMedia).mockReturnValue({ matches: false } as MediaQueryList);
+  const desktopScroll = vi.fn();
+  const view = render(
+    <FileReader
+      {...readerProps}
+      scrollPosition={77}
+      onScroll={desktopScroll}
+    />,
+  );
+  await screen.findByText("Plain text knowledge");
+  const container = view.container.querySelector(
+    ".document-scroll",
+  ) as HTMLElement;
+  await waitFor(() => expect(container.scrollTop).toBe(77));
+  container.scrollTop = 81;
+  fireEvent.scroll(container);
+  expect(desktopScroll).toHaveBeenCalledWith(81);
+});
+
+test("MobileDetails exposes preview/source mode and ratio-derived facts", async () => {
+  vi.spyOn(api, "file").mockResolvedValue(baseFile);
+  vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  const onMode = vi.fn();
+  render(
+    <MobileDetails
+      path={baseFile.path}
+      session={session}
+      mode="preview"
+      onMode={onMode}
+      ratio={6}
+      contextWindow={12}
+      onClose={vi.fn()}
+      onAnalytics={vi.fn()}
+      onSettings={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: "Preview" });
+  fireEvent.click(screen.getByRole("button", { name: "Source" }));
+  expect(onMode).toHaveBeenCalledWith("source");
+  expect(screen.getByText("3")).toBeVisible();
+});
+
+test("Sheet locks and restores body scroll, focus, and both dialog-edge tabs", () => {
+  let scrollY = 88;
+  Object.defineProperty(window, "scrollY", {
+    configurable: true,
+    get: () => scrollY,
+  });
+  const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  const outside = document.createElement("button");
+  document.body.append(outside);
+  outside.focus();
+  const { unmount } = render(
+    <Sheet title="Safe sheet" onClose={vi.fn()}>
+      <button>First action</button>
+      <button>Last action</button>
+    </Sheet>,
+  );
+  const dialog = screen.getByRole("dialog", { name: "Safe sheet" });
+  expect(dialog).toHaveFocus();
+  expect(document.body.style.position).toBe("fixed");
+  fireEvent.keyDown(dialog, { key: "Tab" });
+  expect(screen.getByRole("button", { name: "Close" })).toHaveFocus();
+  dialog.focus();
+  fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+  expect(screen.getByRole("button", { name: "Last action" })).toHaveFocus();
+  unmount();
+  expect(document.body.style.position).toBe("");
+  expect(scrollTo).toHaveBeenLastCalledWith(0, 88);
+  expect(outside).toHaveFocus();
+  outside.remove();
+});
+
+test("timeline paginates and appends entries using next_cursor", async () => {
+  const history = vi.spyOn(api, "history");
+  history
+    .mockResolvedValueOnce({
+      available: true,
+      entries: [
+        {
+          time: "2026-09-01T10:00:00Z",
+          attribution: "human",
+          action: "write",
+          hash: "firsthash",
+        },
+      ],
+      next_cursor: "page-2",
+    })
+    .mockResolvedValueOnce({
+      available: true,
+      entries: [
+        {
+          time: "2026-08-31T10:00:00Z",
+          attribution: "agent",
+          action: "write",
+          hash: "secondhash",
+        },
+      ],
+    });
+  render(
+    <Details
+      file={baseFile}
+      contextWindow={200}
+      onAnalytics={vi.fn()}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+  await screen.findByText("firsthash");
+  await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+  expect(await screen.findByText("secondhas")).toBeVisible();
+  expect(history).toHaveBeenLastCalledWith(baseFile.path, "page-2");
+  expect(
+    screen.queryByRole("button", { name: "Load more" }),
+  ).not.toBeInTheDocument();
+});
+
+test("copy buttons beside the file name copy the agent path and URL", async () => {
+  vi.spyOn(api, "file").mockResolvedValue(baseFile);
+  const onCopy = vi.fn();
+  render(<FileReader {...readerProps} onCopy={onCopy} />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Copy agent path" }),
+  );
+  expect(onCopy).toHaveBeenLastCalledWith(baseFile.path);
+  fireEvent.click(screen.getByRole("button", { name: "Copy URL" }));
+  expect(onCopy).toHaveBeenLastCalledWith(location.href);
+});
+
+test("markdown outline lists headings, jumps to them, and switches out of source mode", async () => {
+  const file: FileResponse = {
+    ...baseFile,
+    path: "/docs/guide.md",
+    name: "guide.md",
+    content_type: "text/markdown",
+    html: "<h1>Guide</h1><p>Intro</p><h2>Install <code>cli</code></h2><h3>Linux</h3>",
+  };
+  vi.spyOn(api, "file").mockResolvedValue(file);
+  const offsets: Record<string, number> = {
+    Guide: 0,
+    "Install cli": 200,
+    Linux: 500,
+  };
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+    function (this: HTMLElement) {
+      const scroller = this.closest(".document-scroll") as HTMLElement | null;
+      const offset = offsets[this.textContent ?? ""];
+      return {
+        top: offset === undefined ? 0 : offset - (scroller?.scrollTop ?? 0),
+      } as DOMRect;
+    },
+  );
+  const onMode = vi.fn();
+  const user = userEvent.setup();
+  const { rerender } = render(
+    <FileReader {...readerProps} path={file.path} onMode={onMode} />,
+  );
+  await user.click(await screen.findByRole("button", { name: "Outline" }));
+  const outline = screen.getByRole("navigation", { name: "Document outline" });
+  const items = within(outline).getAllByRole("button");
+  expect(items.map((item) => item.textContent)).toEqual([
+    "Guide",
+    "Install cli",
+    "Linux",
+  ]);
+  expect(items[2].parentElement).toHaveStyle({ paddingLeft: "28px" });
+
+  const scroller = document.querySelector<HTMLElement>(".document-scroll")!;
+  await user.click(items[1]);
+  expect(scroller.scrollTop).toBe(184);
+  expect(items[1]).toHaveAttribute("aria-current", "location");
+
+  rerender(
+    <FileReader
+      {...readerProps}
+      path={file.path}
+      mode="source"
+      onMode={onMode}
+    />,
+  );
+  await user.click(screen.getByRole("button", { name: "Linux" }));
+  expect(onMode).toHaveBeenCalledWith("preview");
+  rerender(<FileReader {...readerProps} path={file.path} onMode={onMode} />);
+  await waitFor(() => expect(scroller.scrollTop).toBe(484));
+  expect(screen.getByRole("button", { name: "Linux" })).toHaveAttribute(
+    "aria-current",
+    "location",
+  );
+});
+
+test("outline tab is only offered for markdown documents", async () => {
+  vi.spyOn(api, "file").mockResolvedValue(baseFile);
+  render(<FileReader {...readerProps} />);
+  await screen.findByText("Plain text knowledge");
+  expect(
+    screen.queryByRole("button", { name: "Outline" }),
+  ).not.toBeInTheDocument();
+});

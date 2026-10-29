@@ -1,6 +1,7 @@
 package openlore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aakarim/go-openlore/internal/config"
+	"github.com/aakarim/go-openlore/pkg/rules"
 	"github.com/aakarim/go-openlore/pkg/shell"
 	"github.com/aakarim/go-openlore/pkg/shell/cmds"
 	"github.com/aakarim/go-openlore/pkg/vfs"
@@ -196,24 +198,56 @@ func TestConfigAdminWithoutWritableDocsetCanUseConfigWriteVerbs(t *testing.T) {
 	}
 }
 
+// Regression for OPE-46: config administrators get a configViewFS layer, which
+// must forward atomic change sets so `mv` works instead of failing with
+// "operation not supported".
+func TestConfigAdminCanMoveFiles(t *testing.T) {
+	auth := initialRulesAuth()
+	auth.Rules = nil
+	auth.Roles["writer"] = config.RoleSpec{Allow: config.CapabilityRules{Capabilities: []string{"lore:config:edit"}}}
+	server, root := bootRulesServer(t, auth, nil)
+	if err := os.WriteFile(filepath.Join(root, "docs", "a.md"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id, ok := server.identityForName("alice")
+	if !ok {
+		t.Fatal("alice identity not found")
+	}
+	var out, errOut bytes.Buffer
+	if code := server.buildSessionShell(id).ExecPipeline("mv /docs/a.md /docs/b.md", &out, &errOut, nil); code != 0 {
+		t.Fatalf("mv exit = %d, stderr = %q", code, errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "docs", "a.md")); !os.IsNotExist(err) {
+		t.Fatalf("source still exists: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "docs", "b.md")); err != nil || string(data) != "one\n" {
+		t.Fatalf("destination = %q, %v", data, err)
+	}
+	errOut.Reset()
+	if code := server.buildSessionShell(id).ExecPipeline("mv /docs/b.md /opt/openlore/lore.json", &out, &errOut, nil); code == 0 {
+		t.Fatalf("move onto the live config succeeded; stderr = %q", errOut.String())
+	}
+}
+
 func TestWriteLogPersistsStructuredAttribution(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "commits.jsonl")
+	dir := t.TempDir()
+	store := NewJSONLHistoryStore(dir)
 	log := newWriteLog(&wlRecordingFS{}, nil, nil, 1)
-	log.SetCommitRecorder(NewJSONLCommitRecorder(path))
+	log.SetHistoryRecorder(store)
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 	_, err := log.Submit(context.Background(), Attribution{Principal: "adil", Actor: "claude@claude.ai"}, writeCS("/plan.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(filepath.Join(dir, "events.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var record CommitRecord
+	var record HistoryRecord
 	if err := json.Unmarshal(b, &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.Attribution.Principal != "adil" || record.Attribution.Actor != "claude@claude.ai" || record.ChangeSet.Target != "/plan.md" {
+	if record.Attribution.Principal != "adil" || record.Attribution.Actor != "claude@claude.ai" || record.FileKey != "/plan.md" {
 		t.Fatalf("record=%+v", record)
 	}
 }
@@ -242,6 +276,21 @@ func TestConfigViewValidatesBeforePersistAndReloadsExplicitly(t *testing.T) {
 	if _, ok := s.findAuthIdentity("bot"); !ok {
 		t.Fatal("reload did not activate persisted config")
 	}
+	// Missing backing files must not disclose the host config location through
+	// the synthetic config mount, and must retain their missing-file cause.
+	if err := os.Remove(authPath); err != nil {
+		t.Fatal(err)
+	}
+	for operation, run := range map[string]func() error{
+		"read":         func() error { _, err := fsys.ReadFile(authConfigVFSPath); return err },
+		"bounded read": func() error { _, err := fsys.ReadFileBounded(authConfigVFSPath, 1024); return err },
+		"stat":         func() error { _, err := fsys.Stat(authConfigVFSPath); return err },
+		"write":        func() error { _, err := fsys.WriteFileAtomic(authConfigVFSPath, b, vfs.WriteOpts{}); return err },
+	} {
+		if err := run(); !os.IsNotExist(err) || strings.Contains(err.Error(), filepath.Dir(authPath)) {
+			t.Fatalf("%s: want missing-file cause without host path, got %v", operation, err)
+		}
+	}
 	revoked := *next
 	revoked.Roles = map[string]config.RoleSpec{"admin": {}}
 	writeAuthFixture(t, authPath, &revoked)
@@ -269,6 +318,11 @@ func TestLiveAuthRejectsServerDerivedPolicyChanges(t *testing.T) {
 	next.AllowKeyless = &keyless
 	if err := s.validateLiveAuthCandidate(&next); err == nil || !strings.Contains(err.Error(), "restart") {
 		t.Fatalf("posture change accepted: %v", err)
+	}
+	next = *auth
+	next.Rules = map[string]rules.RuleSpec{"limit": {Use: "size/lines", Match: []string{"**"}, With: map[string]any{"max": 10}}}
+	if err := s.validateLiveAuthCandidate(&next); err == nil || !strings.Contains(err.Error(), "restart") {
+		t.Fatalf("top-level rule change accepted: %v", err)
 	}
 }
 

@@ -18,8 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: cachix/install-nix-action@v31
+
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -27,41 +31,70 @@ jobs:
         run: |
           test "$(cat assets/config/VERSION)" = "${GITHUB_REF_NAME#v}"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p .release
+          echo "$GITHUB_SHA" > .release/source-sha.txt
           echo "Release source: $GITHUB_SHA"
 
-      - name: Build release artifacts
-        run: |
-          mkdir dist
-          for platform in \
-            linux/amd64 \
-            linux/arm64 \
-            darwin/amd64 \
-            darwin/arm64 \
-            windows/amd64
-          do
-            GOOS=${platform%/*}
-            GOARCH=${platform#*/}
-            output="dist/openlore-${GOOS}-${GOARCH}"
-            if [ "$GOOS" = windows ]; then
-              output="${output}.exe"
-            fi
-            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-              go build -trimpath -o "$output" ./cmd/openlore
-          done
+      - name: Build dashboard assets
+        run: nix develop --command make dashboard-build
 
-          echo "$GITHUB_SHA" > dist/source-sha.txt
-          (cd dist && sha256sum openlore-* > checksums.txt)
+      - name: Build release candidate without publishing
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish
 
-      - name: Smoke-test release binary
+      - name: Verify release candidate
         run: |
-          test "$(dist/openlore-linux-amd64 version)" = "openlore ${GITHUB_REF_NAME#v}"
           (cd dist && sha256sum --check checksums.txt)
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+          smoke_dir=$(mktemp -d)
+          trap 'rm -rf "$smoke_dir"' EXIT
+          tar -xzf dist/openlore_linux_amd64.tar.gz -C "$smoke_dir"
+          test "$("$smoke_dir/openlore" version)" = "openlore ${GITHUB_REF_NAME#v}"
+
+      - name: Release binaries
+        uses: goreleaser/goreleaser-action@v7
         with:
-          files: dist/*
-          generate_release_notes: true
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          (cd dist && sha256sum --check checksums.txt)
+          test "$(cat .release/source-sha.txt)" = "$GITHUB_SHA"
+
+          smoke_dir=$(mktemp -d)
+          trap 'rm -rf "$smoke_dir"' EXIT
+          tar -xzf dist/openlore_linux_amd64.tar.gz -C "$smoke_dir"
+          test "$("$smoke_dir/openlore" version)" = "openlore ${GITHUB_REF_NAME#v}"
+
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+
+      - name: Publish Homebrew cask
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap aakarim/tap
+          tap="$(brew --repository aakarim/tap)"
+          cp dist/homebrew/Casks/lore.rb "$tap/Casks/lore.rb"
+          brew style --fix --cask aakarim/tap/lore
+          brew style --cask aakarim/tap/lore
+
+          cd "$tap"
+          git add Casks/lore.rb
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Brew cask update for lore version $GITHUB_REF_NAME"
+          git push "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/aakarim/homebrew-tap.git" HEAD:main
 
       - uses: docker/setup-buildx-action@v3
 

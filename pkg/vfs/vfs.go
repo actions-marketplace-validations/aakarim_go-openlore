@@ -20,6 +20,10 @@ type FileInfo struct {
 	Dir         bool
 	FileModTime time.Time
 	FileSize    int64
+	// LinkTarget is set when this path is an alias root for another path. The
+	// entry still reports its target's type and size; shell commands show it
+	// as a symbolic link and tree walks such as find do not descend into it.
+	LinkTarget string
 }
 
 func (fi *FileInfo) Name() string       { return fi.FileName }
@@ -183,14 +187,16 @@ type WritableFS interface {
 	WriteFileAtomic(name string, data []byte, opts WriteOpts) (newHash string, err error)
 
 	// Mkdir creates a folder. It uses plain mkdir semantics (the parent must
-	// exist) but errors if name is not strictly inside a docset — you cannot
+	// exist; a declared docset root counts as existing and is created on
+	// demand) but errors if name is not strictly inside a docset — you cannot
 	// create a docset, nor anything at or above a docset root, through the FS.
 	Mkdir(name string) error
 
 	// MkdirAll creates a folder and any missing ancestors (mkdir -p). Like
-	// Mkdir it errors if name is not strictly inside a docset: the enclosing
-	// docset root must already exist, and every folder it creates must sit
-	// strictly below that root. An already-existing directory is not an error.
+	// Mkdir it errors if name is not strictly inside a declared docset. A
+	// declared docset root missing on disk is created along with the folder,
+	// and every other folder it creates sits strictly below that root. An
+	// already-existing directory is not an error.
 	MkdirAll(name string) error
 
 	// Remove deletes a single file or empty directory at name. It errors if
@@ -280,6 +286,13 @@ type ReadTracker interface {
 	LastReadHash(path string) (hash string, seen bool)
 }
 
+// ReadContentHasher computes the identity of bytes returned by a filesystem.
+// Unlike ReadTracker's durable CAS identity, this may include presentation-only
+// transforms applied by an outer filesystem wrapper.
+type ReadContentHasher interface {
+	ReadContentHash(path string, content []byte) string
+}
+
 // ErrReadOnly is returned by mutating operations when the substrate is in
 // read-only mode.
 var ErrReadOnly = fmt.Errorf("read-only filesystem")
@@ -358,7 +371,14 @@ func File(name, filePath string, content []byte, modTime time.Time) *FileInfo {
 
 // ErrNotFound is returned when a path does not exist.
 func ErrNotFound(p string) error {
-	return fmt.Errorf("not found: %s", p)
+	return notFoundError{path: p}
+}
+
+type notFoundError struct{ path string }
+
+func (e notFoundError) Error() string { return fmt.Sprintf("not found: %s", e.path) }
+func (e notFoundError) Is(target error) bool {
+	return target == fs.ErrNotExist
 }
 
 // ErrIsDirectory is returned when a file operation is attempted on a directory.
